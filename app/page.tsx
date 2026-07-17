@@ -1,476 +1,511 @@
 "use client";
 
-import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import maplibregl, { GeoJSONSource, Map as MapLibreMap, Marker } from "maplibre-gl";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import maplibregl, {
+  GeoJSONSource,
+  Map as MapLibreMap,
+  Marker,
+  type CustomLayerInterface,
+} from "maplibre-gl";
+import { ParticleMotion } from "mapbox-exif-layer";
 import "maplibre-gl/dist/maplibre-gl.css";
+import {
+  WIND_BOUNDS,
+  WIND_COLOR_STOPS,
+  WIND_TEXTURE_BOUNDS,
+  WIND_VELOCITY_RANGE,
+  buildBackwardTrace,
+  compassDirection,
+  encodeWindFramePng,
+  fetchWindField,
+  formatCoordinate,
+  nearestTimeIndex,
+  sampleWind,
+  type Coordinate,
+  type WindField,
+} from "./wind";
 
-type Point = {
-  lat: number;
-  lon: number;
-  age: number;
-  time: string;
-  altitude: number;
-  speed?: number;
-  direction?: number;
+type LoadState = "loading" | "ready" | "error";
+
+const EMPTY_TRACE: GeoJSON.FeatureCollection = {
+  type: "FeatureCollection",
+  features: [],
 };
 
-type Track = {
-  id: string;
-  label: string;
-  color: string;
-  level: string;
-  points: Point[];
-  source: "computed" | "hysplit";
+const validTimeFormatter = new Intl.DateTimeFormat("en-US", {
+  weekday: "short",
+  month: "short",
+  day: "numeric",
+  hour: "numeric",
+  minute: "2-digit",
+  timeZone: "UTC",
+  timeZoneName: "short",
+});
+
+const relativeTimeLabel = (time: Date) => {
+  const hours = Math.round((time.getTime() - Date.now()) / 3_600_000);
+  if (Math.abs(hours) < 1) return "Now";
+  return hours > 0 ? `+${hours} h` : `${hours} h`;
 };
 
-type Place = { name: string; lat: number; lon: number };
+const traceGeoJson = (
+  points: readonly Coordinate[],
+): GeoJSON.FeatureCollection => ({
+  type: "FeatureCollection",
+  features:
+    points.length > 1
+      ? [
+          {
+            type: "Feature",
+            properties: {},
+            geometry: {
+              type: "LineString",
+              coordinates: points.map(({ lon, lat }) => [lon, lat]),
+            },
+          },
+          {
+            type: "Feature",
+            properties: { role: "origin" },
+            geometry: {
+              type: "Point",
+              coordinates: [points.at(-1)?.lon ?? 0, points.at(-1)?.lat ?? 0],
+            },
+          },
+        ]
+      : [],
+});
 
-const PRESETS: Place[] = [
-  { name: "San Francisco", lat: 37.775, lon: -122.419 },
-  { name: "Los Angeles", lat: 34.052, lon: -118.244 },
-  { name: "Denver", lat: 39.739, lon: -104.99 },
-  { name: "Chicago", lat: 41.878, lon: -87.63 },
-  { name: "New York", lat: 40.713, lon: -74.006 },
-];
-
-const LEVELS = [
-  { id: "1000hPa", label: "Near surface", altitude: 110, color: "#78f0c4" },
-  { id: "950hPa", label: "Lower atmosphere", altitude: 500, color: "#ffc968" },
-  { id: "850hPa", label: "Elevated layer", altitude: 1500, color: "#f28cff" },
-];
-
-const EMPTY_GEOJSON: GeoJSON.FeatureCollection = { type: "FeatureCollection", features: [] };
-
-function destination(lat: number, lon: number, bearing: number, distanceKm: number) {
-  const radius = 6371;
-  const delta = distanceKm / radius;
-  const theta = (bearing * Math.PI) / 180;
-  const phi1 = (lat * Math.PI) / 180;
-  const lambda1 = (lon * Math.PI) / 180;
-  const phi2 = Math.asin(
-    Math.sin(phi1) * Math.cos(delta) + Math.cos(phi1) * Math.sin(delta) * Math.cos(theta),
-  );
-  const lambda2 =
-    lambda1 +
-    Math.atan2(
-      Math.sin(theta) * Math.sin(delta) * Math.cos(phi1),
-      Math.cos(delta) - Math.sin(phi1) * Math.sin(phi2),
-    );
-  return {
-    lat: (phi2 * 180) / Math.PI,
-    lon: ((((lambda2 * 180) / Math.PI + 540) % 360) - 180),
-  };
-}
-
-function closestIndex(times: string[], target: Date) {
-  let best = 0;
-  let distance = Infinity;
-  times.forEach((time, index) => {
-    const delta = Math.abs(new Date(`${time}Z`).getTime() - target.getTime());
-    if (delta < distance) {
-      distance = delta;
-      best = index;
-    }
-  });
-  return best;
-}
-
-async function windAt(lat: number, lon: number, level: string, at: Date, signal: AbortSignal) {
-  const key = `ate:${level}:${lat.toFixed(2)}:${lon.toFixed(2)}:${at.toISOString().slice(0, 13)}`;
-  const cached = sessionStorage.getItem(key);
-  if (cached) return JSON.parse(cached) as { speed: number; direction: number; altitude: number };
-
-  const params = new URLSearchParams({
-    latitude: lat.toFixed(4),
-    longitude: lon.toFixed(4),
-    hourly: `wind_speed_${level},wind_direction_${level},geopotential_height_${level}`,
-    wind_speed_unit: "ms",
-    past_days: "4",
-    forecast_days: "2",
-    timezone: "UTC",
-  });
-  const response = await fetch(`https://api.open-meteo.com/v1/forecast?${params}`, { signal });
-  if (!response.ok) throw new Error(`Weather service returned ${response.status}`);
-  const data = await response.json();
-  const index = closestIndex(data.hourly.time, at);
-  const value = {
-    speed: data.hourly[`wind_speed_${level}`][index],
-    direction: data.hourly[`wind_direction_${level}`][index],
-    altitude: data.hourly[`geopotential_height_${level}`][index],
-  };
-  sessionStorage.setItem(key, JSON.stringify(value));
-  return value;
-}
-
-async function computeTrack(
-  arrival: Place,
-  duration: number,
-  level: (typeof LEVELS)[number],
-  signal: AbortSignal,
-  progress: (value: number) => void,
-) {
-  const stepHours = 3;
-  const steps = duration / stepHours;
-  const arrivalTime = new Date();
-  arrivalTime.setUTCMinutes(0, 0, 0);
-  let lat = arrival.lat;
-  let lon = arrival.lon;
-  const points: Point[] = [
-    { lat, lon, age: 0, time: arrivalTime.toISOString(), altitude: level.altitude },
-  ];
-
-  for (let step = 1; step <= steps; step += 1) {
-    const time = new Date(arrivalTime.getTime() - (step - 1) * stepHours * 3_600_000);
-    const wind = await windAt(lat, lon, level.id, time, signal);
-    // Meteorological direction points toward the source. Moving backward follows that bearing.
-    const next = destination(lat, lon, wind.direction, wind.speed * stepHours * 3.6);
-    lat = next.lat;
-    lon = next.lon;
-    points.push({
-      lat,
-      lon,
-      age: -step * stepHours,
-      time: new Date(arrivalTime.getTime() - step * stepHours * 3_600_000).toISOString(),
-      altitude: wind.altitude || level.altitude,
-      speed: wind.speed,
-      direction: wind.direction,
-    });
-    progress(step / steps);
-  }
-
-  return {
-    id: level.id,
-    label: level.label,
-    color: level.color,
-    level: level.id,
-    points,
-    source: "computed" as const,
-  };
-}
-
-function trackGeoJSON(tracks: Track[], visibleHours: number): GeoJSON.FeatureCollection {
-  const features: GeoJSON.Feature[] = [];
-  tracks.forEach((track) => {
-    const points = track.points.filter((point) => Math.abs(point.age) <= visibleHours);
-    if (points.length > 1) {
-      features.push({
-        type: "Feature",
-        properties: { color: track.color, id: track.id },
-        geometry: { type: "LineString", coordinates: points.map((point) => [point.lon, point.lat]) },
-      });
-    }
-    points.forEach((point, index) => {
-      if (index === 0 || index === points.length - 1 || index % 4 === 0) {
-        features.push({
-          type: "Feature",
-          properties: { color: track.color, age: point.age, label: track.label },
-          geometry: { type: "Point", coordinates: [point.lon, point.lat] },
-        });
-      }
-    });
-  });
-  return { type: "FeatureCollection", features };
-}
-
-function parseHysplit(text: string): Track[] {
-  const groups = new Map<string, Point[]>();
-  text.split(/\r?\n/).forEach((line) => {
-    const parts = line.trim().split(/\s+/);
-    if (parts.length < 12 || !parts.slice(0, 12).every((value) => Number.isFinite(Number(value)))) return;
-    const lat = Number(parts[9]);
-    const lon = Number(parts[10]);
-    const altitude = Number(parts[11]);
-    const age = Number(parts[8]);
-    if (Math.abs(lat) > 90 || Math.abs(lon) > 180) return;
-    const year = Number(parts[2]) + (Number(parts[2]) < 70 ? 2000 : 1900);
-    const time = new Date(Date.UTC(year, Number(parts[3]) - 1, Number(parts[4]), Number(parts[5]), Number(parts[6])));
-    const id = parts[0];
-    const list = groups.get(id) ?? [];
-    list.push({ lat, lon, altitude, age, time: time.toISOString() });
-    groups.set(id, list);
-  });
-  const colors = ["#78f0c4", "#ffc968", "#f28cff", "#7bb8ff"];
-  return [...groups.entries()].map(([id, points], index) => ({
-    id: `hysplit-${id}`,
-    label: `HYSPLIT trajectory ${id}`,
-    color: colors[index % colors.length],
-    level: "Imported",
-    points,
-    source: "hysplit",
-  }));
-}
-
-function formatCoordinate(value: number, positive: string, negative: string) {
-  return `${Math.abs(value).toFixed(3)}°${value >= 0 ? positive : negative}`;
-}
+const firstSymbolLayer = (map: MapLibreMap) =>
+  map.getStyle().layers?.find(({ type }) => type === "symbol")?.id;
 
 export default function Home() {
-  const mapContainer = useRef<HTMLDivElement>(null);
+  const mapContainerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
-  const markerRef = useRef<Marker | null>(null);
-  const abortRef = useRef<AbortController | null>(null);
-  const [place, setPlace] = useState<Place>(() => {
-    if (typeof window === "undefined") return PRESETS[0];
-    const params = new URLSearchParams(window.location.search);
-    const lat = Number(params.get("lat"));
-    const lon = Number(params.get("lon"));
-    return Number.isFinite(lat) && Number.isFinite(lon)
-      ? { name: "Shared location", lat, lon }
-      : PRESETS[0];
-  });
-  const initialPlaceRef = useRef(place);
-  const [duration, setDuration] = useState(() => {
-    if (typeof window === "undefined") return 72;
-    const hours = Number(new URLSearchParams(window.location.search).get("hours"));
-    return [24, 48, 72].includes(hours) ? hours : 72;
-  });
-  const [tracks, setTracks] = useState<Track[]>([]);
-  const [visibleHours, setVisibleHours] = useState(duration);
-  const [status, setStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
-  const [progress, setProgress] = useState([0, 0, 0]);
+  const particleLayerRef = useRef<ParticleMotion | null>(null);
+  const selectedMarkerRef = useRef<Marker | null>(null);
+  const [mapReady, setMapReady] = useState(false);
+  const [field, setField] = useState<WindField | null>(null);
+  const [frameIndex, setFrameIndex] = useState(0);
+  const [loadState, setLoadState] = useState<LoadState>("loading");
   const [error, setError] = useState("");
+  const [loadAttempt, setLoadAttempt] = useState(0);
   const [playing, setPlaying] = useState(false);
-  const [panelOpen, setPanelOpen] = useState(true);
-
-  const run = useCallback(async (nextPlace = place, nextDuration = duration) => {
-    abortRef.current?.abort();
-    const controller = new AbortController();
-    abortRef.current = controller;
-    setStatus("loading");
-    setError("");
-    setProgress([0, 0, 0]);
-    setVisibleHours(nextDuration);
-    try {
-      const results = await Promise.all(
-        LEVELS.map((level, levelIndex) =>
-          computeTrack(nextPlace, nextDuration, level, controller.signal, (value) =>
-            setProgress((current) => current.map((item, index) => (index === levelIndex ? value : item))),
-          ),
-        ),
-      );
-      setTracks(results);
-      setStatus("ready");
-      const url = new URL(window.location.href);
-      url.searchParams.set("lat", nextPlace.lat.toFixed(4));
-      url.searchParams.set("lon", nextPlace.lon.toFixed(4));
-      url.searchParams.set("hours", String(nextDuration));
-      window.history.replaceState({}, "", url);
-    } catch (reason) {
-      if ((reason as Error).name === "AbortError") return;
-      setError(reason instanceof Error ? reason.message : "The trajectory could not be calculated.");
-      setStatus("error");
-    }
-  }, [duration, place]);
+  const [selected, setSelected] = useState<Coordinate | null>(null);
+  const [infoOpen, setInfoOpen] = useState(false);
+  const [locating, setLocating] = useState(false);
+  const [locationError, setLocationError] = useState("");
 
   useEffect(() => {
-    if (!mapContainer.current || mapRef.current) return;
-    const initialPlace = initialPlaceRef.current;
+    if (!mapContainerRef.current || mapRef.current) return;
+
     const map = new maplibregl.Map({
-      container: mapContainer.current,
-      style: "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
-      center: [initialPlace.lon, initialPlace.lat],
-      zoom: 4.5,
+      container: mapContainerRef.current,
+      style: "https://tiles.openfreemap.org/styles/dark",
+      center: [-98.5, 38.5],
+      zoom: 3.15,
+      pitch: 18,
+      bearing: -7,
+      maxPitch: 58,
       attributionControl: false,
+      dragRotate: true,
+      touchPitch: true,
     });
-    map.addControl(new maplibregl.NavigationControl({ showCompass: true }), "bottom-right");
+
+    map.addControl(
+      new maplibregl.NavigationControl({ showCompass: true, visualizePitch: true }),
+      "bottom-right",
+    );
     map.addControl(new maplibregl.AttributionControl({ compact: true }), "bottom-left");
+
+    map.on("style.load", () => {
+      map.setProjection({ type: "globe" });
+    });
+
     map.on("load", () => {
-      map.addSource("tracks", { type: "geojson", data: EMPTY_GEOJSON });
-      map.addLayer({
-        id: "trajectory-glow",
-        type: "line",
-        source: "tracks",
-        filter: ["==", ["geometry-type"], "LineString"],
-        paint: { "line-color": ["get", "color"], "line-width": 8, "line-opacity": 0.13, "line-blur": 5 },
+      const padding = window.innerWidth < 720
+        ? { top: 100, right: 24, bottom: 185, left: 24 }
+        : { top: 110, right: 72, bottom: 155, left: 72 };
+
+      map.fitBounds(
+        [
+          [WIND_BOUNDS.west, WIND_BOUNDS.south],
+          [WIND_BOUNDS.east, WIND_BOUNDS.north],
+        ],
+        { padding, duration: 0 },
+      );
+
+      map.addSource("backward-trace", {
+        type: "geojson",
+        data: EMPTY_TRACE,
+        lineMetrics: true,
       });
-      map.addLayer({
-        id: "trajectories",
-        type: "line",
-        source: "tracks",
-        filter: ["==", ["geometry-type"], "LineString"],
-        paint: { "line-color": ["get", "color"], "line-width": 2.5, "line-opacity": 0.92 },
-      });
-      map.addLayer({
-        id: "trajectory-points",
-        type: "circle",
-        source: "tracks",
-        filter: ["==", ["geometry-type"], "Point"],
-        paint: {
-          "circle-radius": 4,
-          "circle-color": ["get", "color"],
-          "circle-stroke-color": "#09110f",
-          "circle-stroke-width": 1.5,
+
+      const beforeId = firstSymbolLayer(map);
+      map.addLayer(
+        {
+          id: "backward-trace-glow",
+          type: "line",
+          source: "backward-trace",
+          filter: ["==", ["geometry-type"], "LineString"],
+          paint: {
+            "line-color": "#ffbd76",
+            "line-width": 11,
+            "line-opacity": 0.16,
+            "line-blur": 7,
+          },
         },
-      });
+        beforeId,
+      );
+      map.addLayer(
+        {
+          id: "backward-trace-line",
+          type: "line",
+          source: "backward-trace",
+          filter: ["==", ["geometry-type"], "LineString"],
+          paint: {
+            "line-gradient": [
+              "interpolate",
+              ["linear"],
+              ["line-progress"],
+              0,
+              "#f6f1d4",
+              0.45,
+              "#8de7d0",
+              1,
+              "#ffac6f",
+            ],
+            "line-width": 2.5,
+            "line-opacity": 0.95,
+          },
+        },
+        beforeId,
+      );
+      map.addLayer(
+        {
+          id: "backward-trace-origin",
+          type: "circle",
+          source: "backward-trace",
+          filter: ["==", ["get", "role"], "origin"],
+          paint: {
+            "circle-radius": 4,
+            "circle-color": "#ffbd76",
+            "circle-stroke-color": "rgba(5, 12, 18, .9)",
+            "circle-stroke-width": 2,
+          },
+        },
+        beforeId,
+      );
+
+      setMapReady(true);
     });
-    map.on("click", (event) => {
-      setPlace({ name: "Selected point", lat: event.lngLat.lat, lon: event.lngLat.lng });
+
+    map.on("click", ({ lngLat }) => {
+      setSelected({ lon: lngLat.lng, lat: lngLat.lat });
+      setLocationError("");
     });
+
     mapRef.current = map;
-    markerRef.current = new maplibregl.Marker({ color: "#f1fff9", scale: 0.85 })
-      .setLngLat([initialPlace.lon, initialPlace.lat])
-      .addTo(map);
-    return () => map.remove();
+    return () => {
+      map.remove();
+      mapRef.current = null;
+    };
   }, []);
 
   useEffect(() => {
-    markerRef.current?.setLngLat([place.lon, place.lat]);
-  }, [place]);
+    const controller = new AbortController();
+
+    fetchWindField(controller.signal)
+      .then((nextField) => {
+        setField(nextField);
+        setFrameIndex(nearestTimeIndex(nextField.times, new Date()));
+        setLoadState("ready");
+      })
+      .catch((reason: unknown) => {
+        if (reason instanceof DOMException && reason.name === "AbortError") return;
+        setError(reason instanceof Error ? reason.message : "Live wind data is unavailable.");
+        setLoadState("error");
+      });
+
+    return () => controller.abort();
+  }, [loadAttempt]);
 
   useEffect(() => {
-    const source = mapRef.current?.getSource("tracks") as GeoJSONSource | undefined;
-    source?.setData(trackGeoJSON(tracks, visibleHours));
-  }, [tracks, visibleHours]);
+    if (!mapReady || !field || particleLayerRef.current || !mapRef.current) return;
+
+    const layer = new ParticleMotion({
+      id: "surface-wind",
+      source: encodeWindFramePng(field, frameIndex),
+      sourceType: "jpeg",
+      bounds: WIND_TEXTURE_BOUNDS,
+      velocityRange: WIND_VELOCITY_RANGE,
+      color: WIND_COLOR_STOPS,
+      unit: "mph",
+      mapRuntime: "maplibre",
+      readyForDisplay: true,
+      particleCount: window.innerWidth < 720 ? 1_500 : 5_200,
+      velocityFactor: 0.04,
+      updateInterval: 55,
+      pointSize: window.innerWidth < 720 ? 1.9 : 2.25,
+      trailLength: 4,
+      trailSizeDecay: 0.72,
+      fadeOpacity: 0.76,
+      ageThreshold: 420,
+      maxAge: 900,
+    });
+
+    // The package implements MapLibre's custom-layer contract at runtime, but its
+    // declaration omits that structural interface. Keep the unavoidable cast here.
+    mapRef.current.addLayer(
+      layer as unknown as CustomLayerInterface,
+      firstSymbolLayer(mapRef.current),
+    );
+    particleLayerRef.current = layer;
+  }, [field, frameIndex, mapReady]);
 
   useEffect(() => {
-    if (!playing || tracks.length === 0) return;
-    const interval = window.setInterval(() => {
-      setVisibleHours((current) => (current >= duration ? 0 : Math.min(duration, current + 3)));
-    }, 240);
-    return () => window.clearInterval(interval);
-  }, [duration, playing, tracks.length]);
+    if (!field || !particleLayerRef.current) return;
+    particleLayerRef.current.setSource(encodeWindFramePng(field, frameIndex), 0.72);
+  }, [field, frameIndex]);
 
-  const overallProgress = Math.round((progress.reduce((sum, value) => sum + value, 0) / 3) * 100);
-  const oldest = useMemo(
-    () => tracks.flatMap((track) => track.points).reduce((value, point) => Math.min(value, point.age), 0),
-    [tracks],
+  useEffect(() => {
+    if (!playing || !field) return;
+    const timer = window.setInterval(() => {
+      setFrameIndex((current) => (current + 1) % field.times.length);
+    }, 850);
+    return () => window.clearInterval(timer);
+  }, [field, playing]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (event.code !== "Space" || target?.matches("button, input, a")) return;
+      event.preventDefault();
+      setPlaying((current) => !current);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
+  const trace = useMemo(
+    () =>
+      field && selected
+        ? buildBackwardTrace(field, frameIndex, selected)
+        : [],
+    [field, frameIndex, selected],
   );
 
-  function choosePreset(preset: Place) {
-    setPlace(preset);
-    mapRef.current?.flyTo({ center: [preset.lon, preset.lat], zoom: 5, duration: 1200 });
-  }
+  useEffect(() => {
+    const source = mapRef.current?.getSource("backward-trace") as GeoJSONSource | undefined;
+    source?.setData(traceGeoJson(trace));
+  }, [trace]);
 
-  function locate() {
-    navigator.geolocation?.getCurrentPosition((position) => {
-      const next = { name: "Your location", lat: position.coords.latitude, lon: position.coords.longitude };
-      setPlace(next);
-      mapRef.current?.flyTo({ center: [next.lon, next.lat], zoom: 7, duration: 1200 });
-    });
-  }
+  useEffect(() => {
+    selectedMarkerRef.current?.remove();
+    selectedMarkerRef.current = null;
+    if (!selected || !mapRef.current) return;
 
-  async function importFile(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0];
-    if (!file) return;
-    const imported = parseHysplit(await file.text());
-    if (!imported.length) {
-      setError("No HYSPLIT endpoint records were found in that file.");
-      setStatus("error");
+    const element = document.createElement("div");
+    element.className = "arrival-marker";
+    element.setAttribute("aria-hidden", "true");
+    selectedMarkerRef.current = new maplibregl.Marker({ element })
+      .setLngLat([selected.lon, selected.lat])
+      .addTo(mapRef.current);
+  }, [selected]);
+
+  const selectedWind = useMemo(
+    () => (field && selected ? sampleWind(field, frameIndex, selected) : null),
+    [field, frameIndex, selected],
+  );
+
+  const validTime = field?.times[frameIndex] ?? null;
+  const nowIndex = field ? nearestTimeIndex(field.times, new Date()) : 0;
+  const traceHours = Math.max(0, trace.length - 1);
+
+  const selectCurrentLocation = useCallback(() => {
+    if (!navigator.geolocation) {
+      setLocationError("Location is not available in this browser.");
       return;
     }
-    setTracks(imported);
-    setDuration(Math.max(24, Math.abs(Math.min(...imported.flatMap((track) => track.points.map((point) => point.age))))));
-    setVisibleHours(999);
-    setStatus("ready");
-  }
+
+    setLocating(true);
+    setLocationError("");
+    navigator.geolocation.getCurrentPosition(
+      ({ coords }) => {
+        const coordinate = { lon: coords.longitude, lat: coords.latitude };
+        setSelected(coordinate);
+        setLocating(false);
+        mapRef.current?.easeTo({ center: [coordinate.lon, coordinate.lat], zoom: 5.4, duration: 1_400 });
+      },
+      () => {
+        setLocating(false);
+        setLocationError("Your location could not be used.");
+      },
+      { enableHighAccuracy: false, timeout: 8_000 },
+    );
+  }, []);
+
+  const retryWind = useCallback(() => {
+    setLoadState("loading");
+    setError("");
+    setLoadAttempt((attempt) => attempt + 1);
+  }, []);
 
   return (
-    <main className="app-shell">
-      <div ref={mapContainer} className="map" aria-label="Interactive atmospheric trajectory map" />
-      <div className="map-vignette" />
+    <main className="experience">
+      <div
+        ref={mapContainerRef}
+        className="map-canvas"
+        role="application"
+        aria-label="Interactive map of forecast surface winds over the United States"
+      />
+      <div className="map-light" aria-hidden="true" />
 
       <header className="topbar">
-        <div className="brand-lockup">
-          <span className="brand-mark"><i /><i /><i /></span>
+        <div className="brand">
+          <span className="brand-glyph" aria-hidden="true"><i /><i /><i /></span>
           <div>
-            <strong>Atmospheric Transport Explorer</strong>
-            <span>Browser-computed air provenance</span>
+            <strong>Atmosphere</strong>
+            <span>United States · surface wind</span>
           </div>
         </div>
         <div className="top-actions">
-          <button className="ghost-button" onClick={locate}>Use my location</button>
-          <button className="icon-button" onClick={() => setPanelOpen((open) => !open)} aria-label="Toggle controls">
-            {panelOpen ? "×" : "☰"}
+          <button
+            className="round-action"
+            type="button"
+            onClick={selectCurrentLocation}
+            aria-label="Use my location"
+            title="Use my location"
+          >
+            <span className={locating ? "locate-icon locating" : "locate-icon"} aria-hidden="true" />
+          </button>
+          <button
+            className="round-action info-action"
+            type="button"
+            onClick={() => setInfoOpen(true)}
+            aria-label="About this wind field"
+            title="About this wind field"
+          >
+            i
           </button>
         </div>
       </header>
 
-      <aside className={`control-panel ${panelOpen ? "open" : ""}`}>
-        <div className="eyebrow"><span className="live-dot" /> Model workspace</div>
-        <h1>Trace the air<br />arriving here.</h1>
-        <p className="intro">Follow modeled wind backward through three atmospheric layers. Everything runs in this browser.</p>
-
-        <section>
-          <label className="section-label">Arrival point</label>
-          <div className="location-card">
-            <div>
-              <strong>{place.name}</strong>
-              <span>{formatCoordinate(place.lat, "N", "S")} · {formatCoordinate(place.lon, "E", "W")}</span>
-            </div>
-            <span className="target-icon">◎</span>
-          </div>
-          <div className="preset-row">
-            {PRESETS.slice(0, 4).map((preset) => (
-              <button key={preset.name} onClick={() => choosePreset(preset)}>{preset.name.split(" ")[0]}</button>
-            ))}
-          </div>
-          <p className="map-hint">Or click anywhere on the map.</p>
-        </section>
-
-        <section>
-          <label className="section-label">Lookback</label>
-          <div className="segment-control">
-            {[24, 48, 72].map((hours) => (
-              <button key={hours} className={duration === hours ? "active" : ""} onClick={() => setDuration(hours)}>{hours}h</button>
-            ))}
-          </div>
-        </section>
-
-        <section>
-          <label className="section-label">Arrival layers</label>
-          <div className="layers">
-            {LEVELS.map((level, index) => (
-              <div className="layer" key={level.id}>
-                <span className="swatch" style={{ background: level.color, boxShadow: `0 0 12px ${level.color}55` }} />
-                <div><strong>{level.label}</strong><span>≈ {level.altitude.toLocaleString()} m ASL · {level.id.replace("hPa", " hPa")}</span></div>
-                {status === "loading" && <span className="layer-progress">{Math.round(progress[index] * 100)}%</span>}
-              </div>
-            ))}
-          </div>
-        </section>
-
-        <button className="primary-button" onClick={() => run()} disabled={status === "loading"}>
-          {status === "loading" ? <><span className="spinner" /> Sampling wind field · {overallProgress}%</> : "Compute back trajectories"}
-        </button>
-        {status === "error" && <p className="error-message">{error}</p>}
-
-        <div className="import-row">
-          <div><strong>Have an authoritative run?</strong><span>Import a NOAA HYSPLIT <code>tdump</code> file.</span></div>
-          <label className="file-button">Import<input type="file" accept=".txt,.tdump,.dat" onChange={importFile} /></label>
+      <section className="field-key" aria-label="Wind speed color scale">
+        <div className="field-key-heading">
+          <span>10 m wind speed</span>
+          <strong>m/s</strong>
         </div>
-      </aside>
+        <div className="speed-ramp" aria-hidden="true" />
+        <div className="speed-labels" aria-hidden="true"><span>0</span><span>10</span><span>20</span><span>35+</span></div>
+      </section>
 
-      {tracks.length > 0 && (
-        <div className="timeline-panel">
-          <div className="timeline-header">
-            <div>
-              <span className="eyebrow">Trajectory time</span>
-              <strong>{visibleHours === 0 ? "Arrival" : `${visibleHours} hours before arrival`}</strong>
-            </div>
-            <button className="play-button" onClick={() => setPlaying((value) => !value)} aria-label={playing ? "Pause animation" : "Play animation"}>
-              {playing ? "Ⅱ" : "▶"}
-            </button>
-          </div>
-          <input
-            className="time-slider"
-            type="range"
-            min="0"
-            max={Math.abs(oldest) || duration}
-            step="3"
-            value={Math.min(visibleHours, Math.abs(oldest) || duration)}
-            onChange={(event) => setVisibleHours(Number(event.target.value))}
-            aria-label="Hours before arrival"
-          />
-          <div className="timeline-labels"><span>Arrival</span><span>−{Math.abs(oldest) || duration} h</span></div>
-          <div className="method-chip">{tracks[0]?.source === "hysplit" ? "Imported NOAA HYSPLIT output" : "Kinematic estimate · Open-Meteo model winds"}</div>
+      {loadState !== "ready" && (
+        <div className={loadState === "error" ? "data-status error" : "data-status"} role="status">
+          {loadState === "loading" ? (
+            <><span className="status-pulse" aria-hidden="true" /> Loading NOAA wind field</>
+          ) : (
+            <>
+              <span>{error}</span>
+              <button type="button" onClick={retryWind}>Retry</button>
+            </>
+          )}
         </div>
       )}
 
-      <div className="science-note">
-        <strong>This is a modeled estimate, not an observation.</strong>
-        <span>Paths use pressure-level winds sampled every three hours. They omit turbulence, vertical motion, and dispersion.</span>
-        <a href="https://www.ready.noaa.gov/READYmetapi.php" target="_blank" rel="noreferrer">Method & limitations ↗</a>
-      </div>
+      {selected && selectedWind ? (
+        <section className="selection-card" aria-live="polite">
+          <button className="selection-close" type="button" onClick={() => setSelected(null)} aria-label="Clear selected point">×</button>
+          <span className="hud-label">Air arriving here</span>
+          <div className="selection-reading">
+            <strong>{Math.round(selectedWind.speed * 2.23694)}</strong>
+            <span>mph<br />from {compassDirection(selectedWind.direction)}</span>
+          </div>
+          <p>{formatCoordinate(selected)}</p>
+          <div className="trace-summary">
+            <span className="trace-line" aria-hidden="true" />
+            <span><strong>{traceHours}-hour backward trace</strong>Kinematic model estimate</span>
+          </div>
+        </section>
+      ) : (
+        <div className="map-hint"><span aria-hidden="true">+</span> Click anywhere to trace the air arriving there</div>
+      )}
+
+      {locationError && <div className="location-error" role="status">{locationError}</div>}
+
+      <section className="timeline" aria-label="Forecast time controls">
+        <button
+          className="play-control"
+          type="button"
+          onClick={() => setPlaying((current) => !current)}
+          disabled={!field}
+          aria-label={playing ? "Pause forecast" : "Play forecast"}
+        >
+          <span className={playing ? "pause-shape" : "play-shape"} aria-hidden="true" />
+        </button>
+        <div className="time-readout">
+          <span>Valid time</span>
+          <strong>{validTime ? validTimeFormatter.format(validTime) : "Preparing forecast"}</strong>
+        </div>
+        <div className="timeline-track">
+          <input
+            type="range"
+            min="0"
+            max={Math.max(0, (field?.times.length ?? 1) - 1)}
+            value={frameIndex}
+            onChange={(event) => {
+              setPlaying(false);
+              setFrameIndex(Number(event.target.value));
+            }}
+            disabled={!field}
+            aria-label="Forecast valid time"
+          />
+          <div className="timeline-meta">
+            <span>{field?.times[0] ? relativeTimeLabel(field.times[0]) : "−24 h"}</span>
+            <button
+              type="button"
+              onClick={() => {
+                setPlaying(false);
+                setFrameIndex(nowIndex);
+              }}
+              disabled={!field}
+            >
+              Now
+            </button>
+            <span>{field?.times.at(-1) ? relativeTimeLabel(field.times.at(-1)!) : "+48 h"}</span>
+          </div>
+        </div>
+        <span className="relative-time">{validTime ? relativeTimeLabel(validTime) : ""}</span>
+      </section>
+
+      <div className={infoOpen ? "info-scrim open" : "info-scrim"} onClick={() => setInfoOpen(false)} aria-hidden="true" />
+      <aside className={infoOpen ? "info-panel open" : "info-panel"} aria-hidden={!infoOpen}>
+        <button className="info-close" type="button" onClick={() => setInfoOpen(false)} aria-label="Close information">×</button>
+        <span className="hud-label">About the field</span>
+        <h1>Read the wind,<br />not a dashboard.</h1>
+        <p className="info-intro">The moving particles reveal the direction and relative speed of forecast wind ten metres above the ground. Drag the map, rotate it, zoom, or move through time.</p>
+
+        <dl className="facts">
+          <div><dt>Model</dt><dd>NOAA GFS seamless</dd></div>
+          <div><dt>Field</dt><dd>10 m wind · hourly</dd></div>
+          <div><dt>Coverage</dt><dd>Contiguous United States</dd></div>
+          <div><dt>Delivery</dt><dd>Open-Meteo · live JSON</dd></div>
+        </dl>
+
+        <section className="method-note">
+          <h2>When you select a point</h2>
+          <p>The highlighted line follows the gridded wind backward one hour at a time. It is a useful kinematic estimate—not an observation, source-apportionment result, or HYSPLIT trajectory.</p>
+        </section>
+
+        <section className="method-note">
+          <h2>Scientific limits</h2>
+          <p>Particles are a visual reading of an interpolated forecast field. Terrain effects, turbulence, vertical motion, chemistry, and dispersion are not represented by the backward trace.</p>
+        </section>
+
+        <div className="source-links">
+          <a href="https://open-meteo.com/en/docs/gfs-api" target="_blank" rel="noreferrer">Forecast documentation ↗</a>
+          <a href="https://www.ncei.noaa.gov/products/weather-climate-models/global-forecast" target="_blank" rel="noreferrer">About NOAA GFS ↗</a>
+        </div>
+      </aside>
     </main>
   );
 }

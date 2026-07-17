@@ -12,39 +12,40 @@ const geistMono = Geist_Mono({
   subsets: ["latin"],
 });
 
+const title = "Atmosphere — See how the air is moving";
+const description =
+  "Explore live NOAA forecast wind across the United States. Rotate, zoom, play through time, and trace the air arriving anywhere.";
+const image =
+  "https://atmospheric-transport-explorer.mkw5053.chatgpt.site/og.png";
+
 export const metadata: Metadata = {
-  title: "Atmospheric Transport Explorer",
-  description: "Trace the modeled origins of air arriving at any location, entirely in your browser.",
+  title,
+  description,
   openGraph: {
-    title: "Atmospheric Transport Explorer",
-    description: "Trace the modeled origins of the air arriving here.",
+    title,
+    description,
     type: "website",
-    images: [{ url: "/og.png", width: 1728, height: 905, alt: "Atmospheric trajectories converging on San Francisco" }],
+    images: [
+      {
+        url: image,
+        width: 1200,
+        height: 630,
+        alt: "Atmosphere forecast wind explorer over the United States",
+      },
+    ],
   },
   twitter: {
     card: "summary_large_image",
-    title: "Atmospheric Transport Explorer",
-    description: "Trace the modeled origins of the air arriving here.",
-    images: ["/og.png"],
-  },
-  icons: {
-    icon: "/favicon.svg",
-    shortcut: "/favicon.svg",
+    title,
+    description,
+    images: [image],
   },
 };
 
-export default function RootLayout({
-  children,
-}: Readonly<{
-  children: React.ReactNode;
-}>) {
+export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="en">
-      <body
-        className={`${geistSans.variable} ${geistMono.variable} antialiased`}
-      >
-        {children}
-      </body>
+      <body className={`${geistSans.variable} ${geistMono.variable}`}>{children}</body>
     </html>
   );
 }
