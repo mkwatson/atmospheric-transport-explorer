@@ -1,36 +1,91 @@
 import { z } from "zod";
 
-export const WIND_BOUNDS = {
+export const DISPLAY_PAST_HOURS = 24;
+export const TRACE_HOURS = 18;
+export const FORECAST_HOURS = 49;
+export const FETCH_PAST_HOURS = DISPLAY_PAST_HOURS + TRACE_HOURS;
+
+export const NATIONAL_WIND_BOUNDS = {
   west: -128,
   east: -65,
   north: 52,
   south: 22,
 } as const;
 
-const GRID_WIDTH = 15;
-const GRID_HEIGHT = 9;
-const METERS_PER_SECOND_TO_MILES_PER_HOUR = 2.236_936;
-const VELOCITY_RANGE = [-100, 100] as const;
+export type WindBounds = Readonly<{
+  west: number;
+  east: number;
+  north: number;
+  south: number;
+}>;
 
-export const WIND_TEXTURE_BOUNDS: [number, number, number, number] = [
-  WIND_BOUNDS.west,
-  WIND_BOUNDS.north,
-  WIND_BOUNDS.east,
-  WIND_BOUNDS.south,
-];
+export const WIND_LEVELS = [
+  {
+    id: "surface",
+    label: "Surface",
+    atmosphericLabel: "Near the ground",
+    pressureLabel: "10 m",
+    approximateHeightLabel: "10 m above ground",
+    nominalHeightMeters: 10,
+    color: [139, 233, 220, 255] as const,
+    speedVariable: "wind_speed_10m",
+    directionVariable: "wind_direction_10m",
+    heightVariable: null,
+  },
+  {
+    id: "850hPa",
+    label: "Lower air",
+    atmosphericLabel: "Lower atmosphere",
+    pressureLabel: "850 hPa",
+    approximateHeightLabel: "about 1.5 km",
+    nominalHeightMeters: 1_500,
+    color: [255, 189, 118, 255] as const,
+    speedVariable: "wind_speed_850hPa",
+    directionVariable: "wind_direction_850hPa",
+    heightVariable: "geopotential_height_850hPa",
+  },
+  {
+    id: "500hPa",
+    label: "Mid atmosphere",
+    atmosphericLabel: "Middle atmosphere",
+    pressureLabel: "500 hPa",
+    approximateHeightLabel: "about 5.6 km",
+    nominalHeightMeters: 5_600,
+    color: [202, 159, 255, 255] as const,
+    speedVariable: "wind_speed_500hPa",
+    directionVariable: "wind_direction_500hPa",
+    heightVariable: "geopotential_height_500hPa",
+  },
+  {
+    id: "250hPa",
+    label: "Jet stream",
+    atmosphericLabel: "Upper atmosphere",
+    pressureLabel: "250 hPa",
+    approximateHeightLabel: "about 10.4 km",
+    nominalHeightMeters: 10_400,
+    color: [126, 163, 255, 255] as const,
+    speedVariable: "wind_speed_250hPa",
+    directionVariable: "wind_direction_250hPa",
+    heightVariable: "geopotential_height_250hPa",
+  },
+] as const;
 
-export const WIND_COLOR_STOPS: Array<[number, number[]]> = [
-  [0, [115, 153, 232]],
-  [6.7, [89, 207, 244]],
-  [13.4, [102, 231, 200]],
-  [20.1, [202, 235, 139]],
-  [29.1, [255, 211, 112]],
-  [40.3, [255, 154, 99]],
-  [55.9, [247, 96, 122]],
-  [78.3, [205, 132, 255]],
-];
+export type WindLevel = (typeof WIND_LEVELS)[number];
+export type WindLevelId = WindLevel["id"];
 
-export const WIND_VELOCITY_RANGE: [number, number] = [...VELOCITY_RANGE];
+export const windLevel = (id: WindLevelId) =>
+  WIND_LEVELS.find((level) => level.id === id) ?? WIND_LEVELS[0];
+
+export const SPEED_PALETTE = [
+  [0, "#7399e8"],
+  [3, "#59cff4"],
+  [6, "#66e7c8"],
+  [9, "#caeb8b"],
+  [13, "#ffd370"],
+  [18, "#ff9a63"],
+  [25, "#f7607a"],
+  [35, "#cd84ff"],
+] as const;
 
 export type Coordinate = Readonly<{
   lon: number;
@@ -44,47 +99,67 @@ export type WindVector = Readonly<{
   direction: number;
 }>;
 
+export type WindReading = WindVector &
+  Readonly<{
+    heightMeters: number;
+  }>;
+
+export type TracePoint = Coordinate &
+  Readonly<{
+    heightMeters: number;
+  }>;
+
 export type WindFrame = Readonly<{
   u: readonly number[];
   v: readonly number[];
+  heights: readonly number[];
+}>;
+
+export type WindLevelField = Readonly<{
+  frames: readonly WindFrame[];
 }>;
 
 export type WindField = Readonly<{
   times: readonly Date[];
-  frames: readonly WindFrame[];
+  levels: Readonly<Partial<Record<WindLevelId, WindLevelField>>>;
   longitudes: readonly number[];
   latitudes: readonly number[];
+  elevations: readonly number[];
   width: number;
   height: number;
+  bounds: WindBounds;
 }>;
 
-const longitudes = Array.from(
-  { length: GRID_WIDTH },
-  (_, index) =>
-    WIND_BOUNDS.west +
-    (index * (WIND_BOUNDS.east - WIND_BOUNDS.west)) / (GRID_WIDTH - 1),
-);
+export type WindFetchSpec = Readonly<{
+  bounds?: WindBounds;
+  width?: number;
+  height?: number;
+  levels?: readonly WindLevelId[];
+}>;
 
-const latitudes = Array.from(
-  { length: GRID_HEIGHT },
-  (_, index) =>
-    WIND_BOUNDS.north -
-    (index * (WIND_BOUNDS.north - WIND_BOUNDS.south)) / (GRID_HEIGHT - 1),
-);
-
-const gridCoordinates = latitudes.flatMap((lat) =>
-  longitudes.map((lon) => ({ lat, lon })),
-);
-
+const numericSeriesSchema = z.array(z.number().nullable());
 const hourlySchema = z.object({
   time: z.array(z.string()),
-  wind_speed_10m: z.array(z.number()),
-  wind_direction_10m: z.array(z.number()),
+  wind_speed_10m: numericSeriesSchema.optional(),
+  wind_direction_10m: numericSeriesSchema.optional(),
+  wind_speed_850hPa: numericSeriesSchema.optional(),
+  wind_direction_850hPa: numericSeriesSchema.optional(),
+  geopotential_height_850hPa: numericSeriesSchema.optional(),
+  wind_speed_500hPa: numericSeriesSchema.optional(),
+  wind_direction_500hPa: numericSeriesSchema.optional(),
+  geopotential_height_500hPa: numericSeriesSchema.optional(),
+  wind_speed_250hPa: numericSeriesSchema.optional(),
+  wind_direction_250hPa: numericSeriesSchema.optional(),
+  geopotential_height_250hPa: numericSeriesSchema.optional(),
 });
+
+type Hourly = z.infer<typeof hourlySchema>;
+type NumericSeriesKey = Exclude<keyof Hourly, "time">;
 
 const forecastLocationSchema = z.object({
   latitude: z.number(),
   longitude: z.number(),
+  elevation: z.number(),
   hourly: hourlySchema,
 });
 
@@ -92,6 +167,26 @@ const forecastResponseSchema = z.array(forecastLocationSchema);
 
 const clamp = (value: number, min: number, max: number) =>
   Math.min(max, Math.max(min, value));
+
+const unique = <T,>(values: readonly T[]) => [...new Set(values)];
+
+const gridFor = (bounds: WindBounds, width: number, height: number) => {
+  const longitudes = Array.from(
+    { length: width },
+    (_, index) =>
+      bounds.west + (index * (bounds.east - bounds.west)) / (width - 1),
+  );
+  const latitudes = Array.from(
+    { length: height },
+    (_, index) =>
+      bounds.north - (index * (bounds.north - bounds.south)) / (height - 1),
+  );
+  const coordinates = latitudes.flatMap((lat) =>
+    longitudes.map((lon) => ({ lat, lon })),
+  );
+
+  return { coordinates, latitudes, longitudes };
+};
 
 export const meteorologicalWindToVector = (
   speed: number,
@@ -115,12 +210,32 @@ const isoUtcDate = (value: string) => {
   return new Date(timestamp);
 };
 
-export const parseWindField = (input: unknown): WindField => {
-  const locations = forecastResponseSchema.parse(input);
+const series = (
+  hourly: Hourly,
+  key: NumericSeriesKey,
+  expectedLength: number,
+) => {
+  const values = hourly[key];
+  if (!values || values.length !== expectedLength) {
+    throw new Error(`The weather service omitted or truncated ${key}.`);
+  }
+  return values;
+};
 
-  if (locations.length !== gridCoordinates.length) {
+export const parseWindField = (
+  input: unknown,
+  spec: Required<WindFetchSpec>,
+): WindField => {
+  const locations = forecastResponseSchema.parse(input);
+  const { coordinates, latitudes, longitudes } = gridFor(
+    spec.bounds,
+    spec.width,
+    spec.height,
+  );
+
+  if (locations.length !== coordinates.length) {
     throw new Error(
-      `Expected ${gridCoordinates.length} wind locations but received ${locations.length}.`,
+      `Expected ${coordinates.length} wind locations but received ${locations.length}.`,
     );
   }
 
@@ -129,63 +244,118 @@ export const parseWindField = (input: unknown): WindField => {
     throw new Error("The weather service returned no forecast times.");
   }
 
-  const hasConsistentShape = locations.every(
+  const hasConsistentTimes = locations.every(
     ({ hourly }) =>
       hourly.time.length === expectedTimes.length &&
-      hourly.wind_speed_10m.length === expectedTimes.length &&
-      hourly.wind_direction_10m.length === expectedTimes.length &&
       hourly.time.every((time, index) => time === expectedTimes[index]),
   );
-
-  if (!hasConsistentShape) {
+  if (!hasConsistentTimes) {
     throw new Error("The weather service returned an inconsistent wind grid.");
   }
 
-  const frames = expectedTimes.map((_, timeIndex) => {
-    const vectors = locations.map(({ hourly }) =>
-      meteorologicalWindToVector(
-        hourly.wind_speed_10m[timeIndex],
-        hourly.wind_direction_10m[timeIndex],
-      ),
-    );
+  const levels = spec.levels.reduce<Partial<Record<WindLevelId, WindLevelField>>>(
+    (parsed, levelId) => {
+      const metadata = windLevel(levelId);
+      const frames = expectedTimes.map((_, timeIndex) => {
+        const values = locations.map(({ elevation, hourly }) => {
+          const speed = series(
+            hourly,
+            metadata.speedVariable,
+            expectedTimes.length,
+          )[timeIndex];
+          const direction = series(
+            hourly,
+            metadata.directionVariable,
+            expectedTimes.length,
+          )[timeIndex];
+          const pressureHeight = metadata.heightVariable
+            ? series(hourly, metadata.heightVariable, expectedTimes.length)[timeIndex]
+            : elevation + metadata.nominalHeightMeters;
+          const isAboveGround =
+            pressureHeight !== null &&
+            (metadata.id === "surface" || pressureHeight > elevation);
 
-    return {
-      u: vectors.map(({ u }) => u),
-      v: vectors.map(({ v }) => v),
-    };
-  });
+          if (
+            speed === null ||
+            direction === null ||
+            pressureHeight === null ||
+            !isAboveGround
+          ) {
+            return { u: Number.NaN, v: Number.NaN, height: Number.NaN };
+          }
+
+          const vector = meteorologicalWindToVector(speed, direction);
+          return { u: vector.u, v: vector.v, height: pressureHeight };
+        });
+
+        return {
+          u: values.map(({ u }) => u),
+          v: values.map(({ v }) => v),
+          heights: values.map(({ height }) => height),
+        };
+      });
+
+      return { ...parsed, [levelId]: { frames } };
+    },
+    {},
+  );
 
   return {
     times: expectedTimes.map(isoUtcDate),
-    frames,
+    levels,
     longitudes,
     latitudes,
-    width: GRID_WIDTH,
-    height: GRID_HEIGHT,
+    elevations: locations.map(({ elevation }) => elevation),
+    width: spec.width,
+    height: spec.height,
+    bounds: spec.bounds,
   };
 };
 
-const windForecastUrl = () => {
+const normalizedSpec = (spec: WindFetchSpec = {}): Required<WindFetchSpec> => ({
+  bounds: spec.bounds ?? NATIONAL_WIND_BOUNDS,
+  width: spec.width ?? 15,
+  height: spec.height ?? 9,
+  levels: spec.levels ?? WIND_LEVELS.map(({ id }) => id),
+});
+
+export const windForecastUrl = (inputSpec: WindFetchSpec = {}) => {
+  const spec = normalizedSpec(inputSpec);
+  const { coordinates } = gridFor(spec.bounds, spec.width, spec.height);
+  const variables = unique(
+    spec.levels.flatMap((levelId) => {
+      const metadata = windLevel(levelId);
+      return [
+        metadata.speedVariable,
+        metadata.directionVariable,
+        ...(metadata.heightVariable ? [metadata.heightVariable] : []),
+      ];
+    }),
+  );
   const parameters = new URLSearchParams({
-    latitude: gridCoordinates.map(({ lat }) => lat.toFixed(2)).join(","),
-    longitude: gridCoordinates.map(({ lon }) => lon.toFixed(2)).join(","),
-    hourly: "wind_speed_10m,wind_direction_10m",
+    latitude: coordinates.map(({ lat }) => lat.toFixed(2)).join(","),
+    longitude: coordinates.map(({ lon }) => lon.toFixed(2)).join(","),
+    hourly: variables.join(","),
     wind_speed_unit: "ms",
     timezone: "UTC",
-    past_hours: "24",
-    forecast_hours: "49",
+    past_hours: String(FETCH_PAST_HOURS),
+    forecast_hours: String(FORECAST_HOURS),
     models: "gfs_seamless",
   });
 
   return `https://api.open-meteo.com/v1/gfs?${parameters}`;
 };
 
-export const fetchWindField = async (signal: AbortSignal) => {
-  const response = await fetch(windForecastUrl(), { signal });
+export const fetchWindField = async (
+  signal: AbortSignal,
+  inputSpec: WindFetchSpec = {},
+) => {
+  const spec = normalizedSpec(inputSpec);
+  const response = await fetch(windForecastUrl(spec), { signal });
   if (!response.ok) {
     throw new Error(`Live wind data is unavailable (${response.status}).`);
   }
-  return parseWindField(await response.json());
+  return parseWindField(await response.json(), spec);
 };
 
 export const nearestTimeIndex = (times: readonly Date[], target: Date) =>
@@ -198,7 +368,7 @@ export const nearestTimeIndex = (times: readonly Date[], target: Date) =>
     0,
   );
 
-const bilinear = (
+const bilinearFinite = (
   values: readonly number[],
   width: number,
   x: number,
@@ -210,98 +380,198 @@ const bilinear = (
   const y1 = Math.min(values.length / width - 1, y0 + 1);
   const xWeight = x - x0;
   const yWeight = y - y0;
-  const top = values[y0 * width + x0] * (1 - xWeight) + values[y0 * width + x1] * xWeight;
-  const bottom = values[y1 * width + x0] * (1 - xWeight) + values[y1 * width + x1] * xWeight;
-  return top * (1 - yWeight) + bottom * yWeight;
+  const samples = [
+    [values[y0 * width + x0], (1 - xWeight) * (1 - yWeight)],
+    [values[y0 * width + x1], xWeight * (1 - yWeight)],
+    [values[y1 * width + x0], (1 - xWeight) * yWeight],
+    [values[y1 * width + x1], xWeight * yWeight],
+  ] as const;
+  const finiteSamples = samples.filter(([value]) => Number.isFinite(value));
+  const totalWeight = finiteSamples.reduce((total, [, weight]) => total + weight, 0);
+  if (totalWeight <= 0) return null;
+  return (
+    finiteSamples.reduce((total, [value, weight]) => total + value * weight, 0) /
+    totalWeight
+  );
 };
 
-export const sampleWind = (
+const spatialPosition = (field: WindField, coordinate: Coordinate) => ({
+  x:
+    ((clamp(coordinate.lon, field.bounds.west, field.bounds.east) -
+      field.bounds.west) /
+      (field.bounds.east - field.bounds.west)) *
+    (field.width - 1),
+  y:
+    ((field.bounds.north -
+      clamp(coordinate.lat, field.bounds.south, field.bounds.north)) /
+      (field.bounds.north - field.bounds.south)) *
+    (field.height - 1),
+});
+
+const sampleFrame = (
   field: WindField,
+  levelId: WindLevelId,
   frameIndex: number,
   coordinate: Coordinate,
-): WindVector => {
-  const x =
-    (clamp(coordinate.lon, WIND_BOUNDS.west, WIND_BOUNDS.east) - WIND_BOUNDS.west) /
-    (WIND_BOUNDS.east - WIND_BOUNDS.west) *
-    (field.width - 1);
-  const y =
-    (WIND_BOUNDS.north - clamp(coordinate.lat, WIND_BOUNDS.south, WIND_BOUNDS.north)) /
-    (WIND_BOUNDS.north - WIND_BOUNDS.south) *
-    (field.height - 1);
-  const frame = field.frames[clamp(frameIndex, 0, field.frames.length - 1)];
-  const u = bilinear(frame.u, field.width, x, y);
-  const v = bilinear(frame.v, field.width, x, y);
+): WindReading | null => {
+  const level = field.levels[levelId];
+  if (!level) return null;
+  const frame = level.frames[clamp(frameIndex, 0, level.frames.length - 1)];
+  const { x, y } = spatialPosition(field, coordinate);
+  const u = bilinearFinite(frame.u, field.width, x, y);
+  const v = bilinearFinite(frame.v, field.width, x, y);
+  const heightMeters = bilinearFinite(frame.heights, field.width, x, y);
+  if (u === null || v === null || heightMeters === null) return null;
 
   return {
     u,
     v,
     speed: Math.hypot(u, v),
     direction: vectorToMeteorologicalDirection(u, v),
+    heightMeters,
+  };
+};
+
+export const sampleWind = (
+  field: WindField,
+  timePosition: number,
+  coordinate: Coordinate,
+  levelId: WindLevelId = "surface",
+): WindReading | null => {
+  const lowerIndex = Math.floor(timePosition);
+  const upperIndex = Math.min(field.times.length - 1, Math.ceil(timePosition));
+  const lower = sampleFrame(field, levelId, lowerIndex, coordinate);
+  const upper = sampleFrame(field, levelId, upperIndex, coordinate);
+  if (!lower || !upper) return lower ?? upper;
+  const weight = timePosition - lowerIndex;
+  const u = lower.u * (1 - weight) + upper.u * weight;
+  const v = lower.v * (1 - weight) + upper.v * weight;
+
+  return {
+    u,
+    v,
+    speed: Math.hypot(u, v),
+    direction: vectorToMeteorologicalDirection(u, v),
+    heightMeters:
+      lower.heightMeters * (1 - weight) + upper.heightMeters * weight,
   };
 };
 
 export const buildBackwardTrace = (
   field: WindField,
-  frameIndex: number,
+  timePosition: number,
   start: Coordinate,
-  requestedHours = 18,
+  levelId: WindLevelId = "surface",
+  requestedHours = TRACE_HOURS,
 ) => {
-  const availableHours = Math.min(requestedHours, frameIndex);
+  const availableHours = Math.min(requestedHours, Math.floor(timePosition));
   const secondsPerStep = 3_600;
   const metersPerDegreeLatitude = 111_320;
+  const startReading = sampleWind(field, timePosition, start, levelId);
+  if (!startReading) return [];
 
-  return Array.from({ length: availableHours }).reduce<readonly Coordinate[]>(
+  return Array.from({ length: availableHours }).reduce<readonly TracePoint[]>(
     (points, _, stepIndex) => {
-      const current = points.at(-1) ?? start;
-      const wind = sampleWind(field, frameIndex - stepIndex, current);
+      const current = points.at(-1) ?? {
+        ...start,
+        heightMeters: startReading.heightMeters,
+      };
+      const wind = sampleWind(
+        field,
+        timePosition - stepIndex,
+        current,
+        levelId,
+      );
+      if (!wind) return points;
       const longitudeScale =
-        metersPerDegreeLatitude * Math.max(0.2, Math.cos((current.lat * Math.PI) / 180));
+        metersPerDegreeLatitude *
+        Math.max(0.2, Math.cos((current.lat * Math.PI) / 180));
 
       return [
         ...points,
         {
           lon: current.lon - (wind.u * secondsPerStep) / longitudeScale,
-          lat: current.lat - (wind.v * secondsPerStep) / metersPerDegreeLatitude,
+          lat: current.lat -
+            (wind.v * secondsPerStep) / metersPerDegreeLatitude,
+          heightMeters: wind.heightMeters,
         },
       ];
     },
-    [start],
+    [{ ...start, heightMeters: startReading.heightMeters }],
   );
 };
 
-const encodeVelocity = (value: number) => {
-  const normalized =
-    (clamp(value, VELOCITY_RANGE[0], VELOCITY_RANGE[1]) - VELOCITY_RANGE[0]) /
-    (VELOCITY_RANGE[1] - VELOCITY_RANGE[0]);
-  return Math.round(normalized * 255);
-};
-
-export const encodeWindFramePng = (field: WindField, frameIndex: number) => {
-  const canvas = document.createElement("canvas");
-  canvas.width = field.width;
-  canvas.height = field.height;
-  const context = canvas.getContext("2d");
-  if (!context) throw new Error("This browser cannot prepare the wind field.");
-
-  const image = context.createImageData(field.width, field.height);
-  const frame = field.frames[frameIndex];
-
-  // Canvas pixel buffers are an imperative browser boundary; mutation stays contained here.
+export const windTexture = (
+  field: WindField,
+  levelId: WindLevelId,
+  frameIndex: number,
+) => {
+  const frame = field.levels[levelId]?.frames[frameIndex];
+  if (!frame) return null;
+  const data = new Float32Array(field.width * field.height * 2);
   frame.u.forEach((u, index) => {
-    const offset = index * 4;
-    image.data[offset] = encodeVelocity(
-      u * METERS_PER_SECOND_TO_MILES_PER_HOUR,
-    );
-    image.data[offset + 1] = encodeVelocity(
-      frame.v[index] * METERS_PER_SECOND_TO_MILES_PER_HOUR,
-    );
-    image.data[offset + 2] = 255;
-    image.data[offset + 3] = 255;
+    data[index * 2] = u;
+    data[index * 2 + 1] = frame.v[index];
   });
-
-  context.putImageData(image, 0, 0);
-  return canvas.toDataURL("image/png");
+  return { data, width: field.width, height: field.height };
 };
+
+export const textureBounds = (bounds: WindBounds): [number, number, number, number] => [
+  bounds.west,
+  bounds.south,
+  bounds.east,
+  bounds.north,
+];
+
+export const timeAtPosition = (
+  times: readonly Date[],
+  timePosition: number,
+) => {
+  const lowerIndex = Math.floor(timePosition);
+  const upperIndex = Math.min(times.length - 1, Math.ceil(timePosition));
+  const weight = timePosition - lowerIndex;
+  return new Date(
+    times[lowerIndex].getTime() * (1 - weight) +
+      times[upperIndex].getTime() * weight,
+  );
+};
+
+export const relativeHourLabel = (timePosition: number, nowIndex: number) => {
+  const hours = Math.round(timePosition - nowIndex);
+  if (hours === 0) return "Now";
+  return hours > 0 ? `+${hours} h` : `${hours} h`;
+};
+
+export const containsCoordinate = (
+  bounds: WindBounds,
+  coordinate: Coordinate,
+) =>
+  coordinate.lon >= bounds.west &&
+  coordinate.lon <= bounds.east &&
+  coordinate.lat >= bounds.south &&
+  coordinate.lat <= bounds.north;
+
+export const clampBounds = (bounds: WindBounds): WindBounds | null => {
+  const clamped = {
+    west: Math.max(NATIONAL_WIND_BOUNDS.west, bounds.west),
+    east: Math.min(NATIONAL_WIND_BOUNDS.east, bounds.east),
+    north: Math.min(NATIONAL_WIND_BOUNDS.north, bounds.north),
+    south: Math.max(NATIONAL_WIND_BOUNDS.south, bounds.south),
+  };
+  return clamped.west < clamped.east && clamped.south < clamped.north
+    ? clamped
+    : null;
+};
+
+export const quantizeBounds = (bounds: WindBounds, step = 0.5): WindBounds => ({
+  west: Math.floor(bounds.west / step) * step,
+  east: Math.ceil(bounds.east / step) * step,
+  north: Math.ceil(bounds.north / step) * step,
+  south: Math.floor(bounds.south / step) * step,
+});
+
+export const depthExaggeration = (zoom: number) =>
+  Math.max(2, Math.round(24 / 2 ** Math.max(0, zoom - 3)));
 
 const COMPASS_POINTS = [
   "N",
@@ -327,3 +597,8 @@ export const compassDirection = (degrees: number) =>
 
 export const formatCoordinate = (coordinate: Coordinate) =>
   `${Math.abs(coordinate.lat).toFixed(2)}°${coordinate.lat >= 0 ? "N" : "S"}, ${Math.abs(coordinate.lon).toFixed(2)}°${coordinate.lon >= 0 ? "E" : "W"}`;
+
+export const formatHeight = (levelId: WindLevelId, heightMeters: number) =>
+  levelId === "surface"
+    ? "10 m AGL"
+    : `${(heightMeters / 1_000).toFixed(1)} km ASL`;
