@@ -66,6 +66,8 @@ const validTimeFormatter = new Intl.DateTimeFormat("en-US", {
 const PLAYBACK_MILLISECONDS_PER_HOUR = 1_150;
 const REGIONAL_ZOOM = 4.35;
 const REGIONAL_GRID = { desktop: [21, 13], mobile: [17, 11] } as const;
+const FIELD_WARMUP_MILLISECONDS = 1_200;
+const FIELD_FADE_MILLISECONDS = 800;
 const PARTICLE_SPEED_FACTOR: Readonly<Record<WindLevelId, number>> = {
   surface: 1.5,
   "850hPa": 1.05,
@@ -130,6 +132,9 @@ const regionalViewport = (map: MapLibreMap) => {
 
 const regionalKey = (bounds: WindBounds, levelId: WindLevelId) =>
   `${levelId}:${bounds.west}:${bounds.south}:${bounds.east}:${bounds.north}`;
+
+const particleFieldId = (field: WindField, levelId: WindLevelId) =>
+  `wind:${regionalKey(field.bounds, levelId)}:${field.width}x${field.height}`;
 
 const speedMph = (reading: WindReading) =>
   Math.round(reading.speed * 2.236_936);
@@ -421,7 +426,11 @@ export default function Home() {
     if (!desiredPrimaryField) return;
     const previous = lastPrimaryFieldRef.current;
     lastPrimaryFieldRef.current = desiredPrimaryField;
-    if (!previous || previous === desiredPrimaryField || reducedMotion) {
+    const sameParticleField =
+      previous &&
+      particleFieldId(previous, selectedLevel) ===
+        particleFieldId(desiredPrimaryField, selectedLevel);
+    if (!previous || sameParticleField || reducedMotion) {
       setPreviousPrimaryField(null);
       setFieldBlend(1);
       return;
@@ -429,14 +438,22 @@ export default function Home() {
 
     setPreviousPrimaryField(previous);
     setFieldBlend(0);
-  }, [desiredPrimaryField, reducedMotion]);
+  }, [desiredPrimaryField, reducedMotion, selectedLevel]);
 
   useEffect(() => {
     if (!previousPrimaryField || reducedMotion) return;
     const startedAt = performance.now();
     let animationFrame = 0;
     const animate = (now: number) => {
-      const nextBlend = Math.min(1, (now - startedAt) / 480);
+      const fadeProgress = Math.min(
+        1,
+        Math.max(
+          0,
+          (now - startedAt - FIELD_WARMUP_MILLISECONDS) /
+            FIELD_FADE_MILLISECONDS,
+        ),
+      );
+      const nextBlend = fadeProgress * fadeProgress * (3 - 2 * fadeProgress);
       setFieldBlend(nextBlend);
       if (nextBlend < 1) {
         animationFrame = requestAnimationFrame(animate);
@@ -529,12 +546,11 @@ export default function Home() {
       .addTo(mapRef.current);
   }, [selected]);
 
-  const zoomDensity = 1 + Math.max(0, Math.min(4, mapZoom - 3.2)) * 0.18;
   const particleCount = Math.max(
     isMobile ? 1_800 : 4_800,
     Math.min(
       isMobile ? 5_500 : 12_000,
-      Math.round((viewportPixels / 160) * zoomDensity),
+      Math.round(viewportPixels / 160),
     ),
   );
   const selectedMetadata = windLevel(selectedLevel);
@@ -597,14 +613,13 @@ export default function Home() {
     } = weatherLayers;
     const particleLayerFor = (
       field: WindField | null,
-      id: string,
       opacity: number,
     ) => {
-      if (!field?.levels[selectedLevel] || opacity <= 0.001) return null;
+      if (!field?.levels[selectedLevel]) return null;
       const pair = texturePair(field, selectedLevel, timePosition);
       if (!pair.image || !pair.image2) return null;
       return new ParticleLayer({
-        id,
+        id: particleFieldId(field, selectedLevel),
         image: pair.image,
         image2: pair.image2,
         imageWeight: pair.imageWeight,
@@ -625,12 +640,10 @@ export default function Home() {
     if (!depthMode) {
       const previousParticles = particleLayerFor(
         previousPrimaryField,
-        "primary-wind-previous",
         1 - fieldBlend,
       );
       const currentParticles = particleLayerFor(
         activePrimaryField,
-        "primary-wind-current",
         fieldBlend,
       );
       if (previousParticles) layers.push(previousParticles);
