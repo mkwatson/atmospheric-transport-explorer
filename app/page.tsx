@@ -14,7 +14,6 @@ import {
   buildBackwardTrace,
   clampBounds,
   containsCoordinate,
-  depthExaggeration,
   fetchWindField,
   formatCoordinate,
   formatHeight,
@@ -46,13 +45,6 @@ type TraceDatum = Readonly<{
   selected: boolean;
 }>;
 
-type SegmentDatum = Readonly<{
-  source: readonly [number, number, number];
-  target: readonly [number, number, number];
-  color: readonly [number, number, number, number];
-  width: number;
-}>;
-
 const validTimeFormatter = new Intl.DateTimeFormat("en-US", {
   weekday: "short",
   month: "short",
@@ -73,6 +65,12 @@ const PARTICLE_SPEED_FACTOR: Readonly<Record<WindLevelId, number>> = {
   "850hPa": 1.05,
   "500hPa": 0.82,
   "250hPa": 0.65,
+};
+const COMPACT_LEVEL_LABELS: Readonly<Record<WindLevelId, string>> = {
+  surface: "Ground",
+  "850hPa": "Low",
+  "500hPa": "Mid",
+  "250hPa": "Jet",
 };
 const textureCache = new WeakMap<
   WindField,
@@ -139,81 +137,6 @@ const particleFieldId = (field: WindField, levelId: WindLevelId) =>
 const speedMph = (reading: WindReading) =>
   Math.round(reading.speed * 2.236_936);
 
-const elevatedArrowSegments = (
-  field: WindField,
-  levelId: WindLevelId,
-  timePosition: number,
-  heightScale: number,
-  selected: boolean,
-): readonly SegmentDatum[] => {
-  const metadata = windLevel(levelId);
-  const gridStep = field.width > 18 ? 2 : 1;
-  const lonStep = (field.bounds.east - field.bounds.west) / (field.width - 1);
-  const latStep = (field.bounds.north - field.bounds.south) / (field.height - 1);
-  const maximumLength = Math.min(lonStep, latStep) * 0.66;
-
-  return field.latitudes.flatMap((lat, row) =>
-    field.longitudes.flatMap((lon, column) => {
-      if (row % gridStep !== 0 || column % gridStep !== 0) return [];
-      const reading = sampleWind(field, timePosition, { lon, lat }, levelId);
-      if (!reading || reading.speed < 0.2) return [];
-      const length = maximumLength * (0.3 + Math.min(1, reading.speed / 35) * 0.7);
-      const magnitude = Math.hypot(reading.u, reading.v);
-      const dx = (reading.u / magnitude) * length;
-      const dy = (reading.v / magnitude) * length;
-      const tip: [number, number, number] = [
-        lon + dx / Math.max(0.35, Math.cos((lat * Math.PI) / 180)),
-        lat + dy,
-        reading.heightMeters * heightScale,
-      ];
-      const tail: [number, number, number] = [
-        lon - dx * 0.4,
-        lat - dy * 0.4,
-        reading.heightMeters * heightScale,
-      ];
-      const headLength = length * 0.28;
-      const ux = dx / length;
-      const uy = dy / length;
-      const backX = tip[0] - ux * headLength;
-      const backY = tip[1] - uy * headLength;
-      const left: [number, number, number] = [
-        backX - uy * headLength * 0.55,
-        backY + ux * headLength * 0.55,
-        tip[2],
-      ];
-      const right: [number, number, number] = [
-        backX + uy * headLength * 0.55,
-        backY - ux * headLength * 0.55,
-        tip[2],
-      ];
-      const color = [
-        metadata.color[0],
-        metadata.color[1],
-        metadata.color[2],
-        selected ? 245 : 165,
-      ] as const;
-      const width = selected ? 2.4 : 1.35;
-
-      return [
-        { source: tail, target: tip, color, width },
-        { source: tip, target: left, color, width },
-        { source: tip, target: right, color, width },
-      ];
-    }),
-  );
-};
-
-const atmosphericGuidePath = (
-  bounds: WindBounds,
-  heightMeters: number,
-): [number, number, number][] => [
-  [bounds.west, bounds.south, heightMeters],
-  [bounds.east, bounds.south, heightMeters],
-  [bounds.east, bounds.north, heightMeters],
-  [bounds.west, bounds.north, heightMeters],
-  [bounds.west, bounds.south, heightMeters],
-];
-
 export default function Home() {
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
@@ -222,7 +145,6 @@ export default function Home() {
   const regionalCacheRef = useRef(new Map<string, WindField>());
   const lastPrimaryFieldRef = useRef<WindField | null>(null);
   const timePositionRef = useRef(0);
-  const previousCameraRef = useRef({ pitch: 18, bearing: -7 });
   const [mapReady, setMapReady] = useState(false);
   const [nationalField, setNationalField] = useState<WindField | null>(null);
   const [regionalField, setRegionalField] = useState<WindField | null>(null);
@@ -237,14 +159,11 @@ export default function Home() {
   const [selected, setSelected] = useState<Coordinate | null>(null);
   const [selectedLevel, setSelectedLevel] = useState<WindLevelId>("surface");
   const [showAllPaths, setShowAllPaths] = useState(false);
-  const [compareAtmosphere, setCompareAtmosphere] = useState(false);
-  const [depthMode, setDepthMode] = useState(false);
-  const [levelMenuOpen, setLevelMenuOpen] = useState(false);
+  const [selectionExpanded, setSelectionExpanded] = useState(true);
   const [infoOpen, setInfoOpen] = useState(false);
   const [locating, setLocating] = useState(false);
   const [locationError, setLocationError] = useState("");
   const [viewportBounds, setViewportBounds] = useState<WindBounds | null>(null);
-  const [mapZoom, setMapZoom] = useState(3.15);
   const [viewportPixels, setViewportPixels] = useState(1_000_000);
   const [isMobile, setIsMobile] = useState(false);
   const [reducedMotion, setReducedMotion] = useState(false);
@@ -257,7 +176,6 @@ export default function Home() {
       setRegionalField(null);
       setRefinementState("national");
     }
-    setMapZoom(map.getZoom());
     const canvas = map.getCanvas();
     setViewportPixels(canvas.clientWidth * canvas.clientHeight);
     setIsMobile(canvas.clientWidth < 720);
@@ -338,12 +256,12 @@ export default function Home() {
     map.on("resize", () => updateViewport(map));
     map.on("click", ({ lngLat }) => {
       const coordinate = { lon: lngLat.lng, lat: lngLat.lat };
-      setLevelMenuOpen(false);
       if (!containsCoordinate(NATIONAL_WIND_BOUNDS, coordinate)) {
         setLocationError("Choose a point inside the contiguous U.S. wind field.");
         return;
       }
       setSelected(coordinate);
+      setSelectionExpanded(true);
       setLocationError("");
     });
 
@@ -506,7 +424,6 @@ export default function Home() {
     const onKeyDown = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
       if (event.code === "Escape") {
-        setLevelMenuOpen(false);
         setInfoOpen(false);
         return;
       }
@@ -517,22 +434,6 @@ export default function Home() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
-
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map) return;
-    if (depthMode) {
-      previousCameraRef.current = { pitch: map.getPitch(), bearing: map.getBearing() };
-      map.easeTo({ pitch: 56, bearing: -18, duration: reducedMotion ? 0 : 850 });
-      return;
-    }
-    const previous = previousCameraRef.current;
-    map.easeTo({
-      pitch: previous.pitch,
-      bearing: previous.bearing,
-      duration: reducedMotion ? 0 : 700,
-    });
-  }, [depthMode, reducedMotion]);
 
   useEffect(() => {
     selectedMarkerRef.current?.remove();
@@ -554,7 +455,6 @@ export default function Home() {
     ),
   );
   const selectedMetadata = windLevel(selectedLevel);
-  const heightScale = depthExaggeration(mapZoom);
   const validTime = nationalField
     ? timeAtPosition(nationalField.times, timePosition)
     : null;
@@ -637,20 +537,18 @@ export default function Home() {
       });
     };
 
-    if (!depthMode) {
-      const previousParticles = particleLayerFor(
-        previousPrimaryField,
-        1 - fieldBlend,
-      );
-      const currentParticles = particleLayerFor(
-        activePrimaryField,
-        fieldBlend,
-      );
-      if (previousParticles) layers.push(previousParticles);
-      if (currentParticles) layers.push(currentParticles);
-    }
+    const previousParticles = particleLayerFor(
+      previousPrimaryField,
+      1 - fieldBlend,
+    );
+    const currentParticles = particleLayerFor(
+      activePrimaryField,
+      fieldBlend,
+    );
+    if (previousParticles) layers.push(previousParticles);
+    if (currentParticles) layers.push(currentParticles);
 
-    if (reducedMotion && !depthMode && activePrimaryField?.levels[selectedLevel]) {
+    if (reducedMotion && activePrimaryField?.levels[selectedLevel]) {
       const pair = texturePair(activePrimaryField, selectedLevel, timePosition);
       if (pair.image && pair.image2) {
         layers.push(
@@ -673,82 +571,9 @@ export default function Home() {
       }
     }
 
-    if (compareAtmosphere && nationalField && !depthMode) {
-      WIND_LEVELS.filter(({ id }) => id !== selectedLevel).forEach((level) => {
-        const pair = texturePair(nationalField, level.id, timePosition);
-        if (!pair.image || !pair.image2) return;
-        layers.push(
-          new GridLayer({
-            id: `context-${level.id}`,
-            image: pair.image,
-            image2: pair.image2,
-            imageWeight: pair.imageWeight,
-            imageType: ImageType.VECTOR,
-            imageInterpolation: ImageInterpolation.CUBIC,
-            bounds: textureBounds(nationalField.bounds),
-            style: GridStyle.ARROW,
-            density: -1,
-            iconBounds: [0, 50],
-            iconSize: [5, 13],
-            iconColor: level.color,
-            opacity: 0.38,
-          }),
-        );
-      });
-    }
-
-    if (depthMode && nationalField) {
-      const segments = WIND_LEVELS.flatMap((level) =>
-        elevatedArrowSegments(
-          nationalField,
-          level.id,
-          timePosition,
-          heightScale,
-          level.id === selectedLevel,
-        ),
-      );
-      layers.push(
-        new PathLayer<SegmentDatum>({
-          id: "elevated-wind-context",
-          data: segments,
-          getPath: ({ source, target }) => [source, target],
-          getColor: ({ color }) => color,
-          getWidth: ({ width }) => width,
-          widthUnits: "pixels",
-          widthMinPixels: 1,
-          opacity: 0.96,
-          pickable: false,
-        }),
-      );
-
-      const guides = WIND_LEVELS.map((level) => ({
-        id: level.id,
-        path: atmosphericGuidePath(
-          NATIONAL_WIND_BOUNDS,
-          level.nominalHeightMeters * heightScale,
-        ),
-        color: [level.color[0], level.color[1], level.color[2], 42] as const,
-      }));
-      layers.push(
-        new PathLayer({
-          id: "atmospheric-level-guides",
-          data: guides,
-          getPath: (datum: (typeof guides)[number]) => datum.path,
-          getColor: (datum: (typeof guides)[number]) => datum.color,
-          getWidth: 0.8,
-          widthUnits: "pixels",
-          pickable: false,
-        }),
-      );
-    }
-
     if (traces.length > 0) {
       const tracePath = (datum: TraceDatum): [number, number, number][] =>
-        datum.path.map(({ lon, lat, heightMeters }) => [
-          lon,
-          lat,
-          depthMode ? heightMeters * heightScale : 0,
-        ]);
+        datum.path.map(({ lon, lat }) => [lon, lat, 0]);
       layers.push(
         new PathLayer<TraceDatum>({
           id: "backward-trace-glow",
@@ -765,7 +590,6 @@ export default function Home() {
           jointRounded: true,
           capRounded: true,
           pickable: false,
-          parameters: { depthCompare: depthMode ? "less-equal" : "always" },
         }),
         new PathLayer<TraceDatum>({
           id: "backward-traces",
@@ -782,7 +606,6 @@ export default function Home() {
           jointRounded: true,
           capRounded: true,
           pickable: false,
-          parameters: { depthCompare: depthMode ? "less-equal" : "always" },
         }),
       );
 
@@ -797,7 +620,7 @@ export default function Home() {
           getPosition: ({ position }: (typeof origins)[number]) => [
             position?.lon ?? 0,
             position?.lat ?? 0,
-            depthMode ? (position?.heightMeters ?? 0) * heightScale : 0,
+            0,
           ],
           getFillColor: ({ trace }: (typeof origins)[number]) => trace.color,
           getLineColor: [5, 12, 18, 220],
@@ -812,66 +635,14 @@ export default function Home() {
       );
     }
 
-    if (depthMode && selected && levelReadings.length > 0) {
-      const available = levelReadings.filter(
-        (item): item is typeof item & { reading: WindReading } => Boolean(item.reading),
-      );
-      const maximumHeight = Math.max(
-        0,
-        ...available.map(({ reading }) => reading.heightMeters * heightScale),
-      );
-      const column = [
-        {
-          path: [
-            [selected.lon, selected.lat, 0],
-            [selected.lon, selected.lat, maximumHeight],
-          ] as [number, number, number][],
-        },
-      ];
-      layers.push(
-        new PathLayer<(typeof column)[number]>({
-          id: "selected-air-column",
-          data: column,
-          getPath: ({ path }) => path,
-          getColor: [220, 238, 235, 125],
-          getWidth: 1.2,
-          widthUnits: "pixels",
-          pickable: false,
-        }),
-        new ScatterplotLayer({
-          id: "selected-air-column-levels",
-          data: available,
-          getPosition: ({ reading }) => [
-            selected.lon,
-            selected.lat,
-            reading.heightMeters * heightScale,
-          ],
-          getFillColor: ({ level }) => level.color,
-          getLineColor: [5, 12, 18, 230],
-          getRadius: ({ level }) => (level.id === selectedLevel ? 6 : 3.8),
-          radiusUnits: "pixels",
-          stroked: true,
-          getLineWidth: 1.4,
-          lineWidthUnits: "pixels",
-          pickable: false,
-        }),
-      );
-    }
-
     return layers;
   }, [
     activePrimaryField,
-    compareAtmosphere,
-    depthMode,
     fieldBlend,
-    heightScale,
     isMobile,
-    levelReadings,
-    nationalField,
     particleCount,
     previousPrimaryField,
     reducedMotion,
-    selected,
     selectedLevel,
     selectedMetadata.color,
     timePosition,
@@ -899,6 +670,7 @@ export default function Home() {
           return;
         }
         setSelected(coordinate);
+        setSelectionExpanded(true);
         mapRef.current?.easeTo({
           center: [coordinate.lon, coordinate.lat],
           zoom: 5.4,
@@ -919,16 +691,8 @@ export default function Home() {
     setLoadAttempt((attempt) => attempt + 1);
   }, []);
 
-  const toggleDepth = () => {
-    setDepthMode((current) => {
-      const next = !current;
-      if (next) setCompareAtmosphere(true);
-      return next;
-    });
-  };
-
   return (
-    <main className={depthMode ? "experience depth-mode" : "experience"}>
+    <main className="experience">
       <div
         ref={mapContainerRef}
         className="map-canvas"
@@ -946,9 +710,6 @@ export default function Home() {
           </div>
         </div>
         <div className="top-actions">
-          {depthMode && (
-            <span className="depth-status">Depth · height ×{heightScale}</span>
-          )}
           <button
             className="round-action"
             type="button"
@@ -971,64 +732,45 @@ export default function Home() {
       </header>
 
       <section className="field-key" aria-label="Wind field and atmospheric level">
-        <button
-          className="level-trigger"
-          type="button"
-          onClick={() => setLevelMenuOpen((current) => !current)}
-          aria-expanded={levelMenuOpen}
-          aria-controls="level-menu"
-        >
+        <fieldset className="altitude-control">
+          <legend>Altitude</legend>
+          <div className="altitude-options">
+            {WIND_LEVELS.slice().reverse().map((level) => (
+              <label
+                className={level.id === selectedLevel ? "altitude-option selected" : "altitude-option"}
+                key={level.id}
+              >
+                <input
+                  type="radio"
+                  name="atmospheric-level"
+                  value={level.id}
+                  checked={level.id === selectedLevel}
+                  onChange={() => setSelectedLevel(level.id)}
+                  aria-label={`${level.label}, ${level.pressureLabel}, ${level.approximateHeightLabel}`}
+                />
+                <i style={{ background: `rgb(${level.color.slice(0, 3).join(" ")})` }} aria-hidden="true" />
+                <span>
+                  <b>
+                    <span className="level-label-full">{level.label}</span>
+                    <span className="level-label-compact">{COMPACT_LEVEL_LABELS[level.id]}</span>
+                  </b>
+                  <small>{level.pressureLabel} · {level.approximateHeightLabel}</small>
+                </span>
+                <em aria-hidden="true">{level.id === selectedLevel ? "●" : ""}</em>
+              </label>
+            ))}
+          </div>
+        </fieldset>
+        <div className="selected-level-detail">
+          <i style={{ background: `rgb(${selectedMetadata.color.slice(0, 3).join(" ")})` }} aria-hidden="true" />
           <span>
-            <i style={{ background: `rgb(${selectedMetadata.color.slice(0, 3).join(" ")})` }} />
             <b>{selectedMetadata.label}</b>
-            <small>{selectedMetadata.pressureLabel}</small>
+            <small>{selectedMetadata.pressureLabel} · {selectedMetadata.approximateHeightLabel}</small>
           </span>
-          <em aria-hidden="true">⌄</em>
-        </button>
-        <div className="field-key-heading"><span>Wind speed</span><strong>m/s</strong></div>
+        </div>
+        <div className="field-key-heading"><span>{selectedMetadata.label} wind speed</span><strong>m/s</strong></div>
         <div className="speed-ramp" aria-hidden="true" />
         <div className="speed-labels" aria-hidden="true"><span>0</span><span>10</span><span>20</span><span>35+</span></div>
-
-        {levelMenuOpen && (
-          <div className="level-menu" id="level-menu">
-            <span className="hud-label">Atmospheric level</span>
-            <div className="level-options">
-              {WIND_LEVELS.slice().reverse().map((level) => (
-                <button
-                  type="button"
-                  className={level.id === selectedLevel ? "selected" : ""}
-                  key={level.id}
-                  onClick={() => {
-                    setSelectedLevel(level.id);
-                    setLevelMenuOpen(false);
-                  }}
-                >
-                  <i style={{ background: `rgb(${level.color.slice(0, 3).join(" ")})` }} />
-                  <span><b>{level.label}</b><small>{level.pressureLabel} · {level.approximateHeightLabel}</small></span>
-                  <em>{level.id === selectedLevel ? "●" : ""}</em>
-                </button>
-              ))}
-            </div>
-            <div className="level-modes">
-              <button
-                type="button"
-                className={compareAtmosphere ? "active" : ""}
-                onClick={() => setCompareAtmosphere((current) => !current)}
-                aria-pressed={compareAtmosphere}
-              >
-                <span>Atmospheric stack</span><small>Compare all four levels</small>
-              </button>
-              <button
-                type="button"
-                className={depthMode ? "active" : ""}
-                onClick={toggleDepth}
-                aria-pressed={depthMode}
-              >
-                <span>Depth view</span><small>Tilt and separate the atmosphere</small>
-              </button>
-            </div>
-          </div>
-        )}
       </section>
 
       {loadState !== "ready" && (
@@ -1048,60 +790,88 @@ export default function Home() {
       )}
 
       {selected ? (
-        <section className="selection-card" aria-live="polite">
+        <section
+          className={selectionExpanded ? "selection-card expanded" : "selection-card collapsed"}
+          aria-live="polite"
+        >
+          <button
+            className="selection-toggle"
+            type="button"
+            onClick={() => setSelectionExpanded((current) => !current)}
+            aria-expanded={selectionExpanded}
+            aria-controls="selection-details"
+            aria-label={selectionExpanded ? "Collapse atmospheric comparison" : "Expand atmospheric comparison"}
+          >
+            <span aria-hidden="true">⌃</span>
+          </button>
           <button className="selection-close" type="button" onClick={() => setSelected(null)} aria-label="Clear selected point">×</button>
-          <span className="hud-label">Wind column arriving here</span>
-          <p className="selection-coordinate">{formatCoordinate(selected)}</p>
-          <div className="air-column">
-            {levelReadings.slice().reverse().map(({ level, reading }) => (
-              <button
-                type="button"
-                className={level.id === selectedLevel ? "selected" : ""}
-                key={level.id}
-                disabled={!reading}
-                onClick={() => setSelectedLevel(level.id)}
-              >
-                <i style={{ background: `rgb(${level.color.slice(0, 3).join(" ")})` }} />
-                <span><b>{level.label}</b><small>{level.pressureLabel}</small></span>
-                {reading ? (
-                  <>
-                    <em style={{ transform: `rotate(${reading.direction + 180}deg)` }}>↑</em>
-                    <strong>{speedMph(reading)}<small> mph</small></strong>
-                    <u>{formatHeight(level.id, reading.heightMeters)}</u>
-                  </>
-                ) : (
-                  <u>Below terrain</u>
-                )}
-              </button>
-            ))}
-          </div>
-          <div className="trace-actions">
-            <button
-              type="button"
-              className={showAllPaths ? "active" : ""}
-              onClick={() => setShowAllPaths((current) => !current)}
-              aria-pressed={showAllPaths}
-            >
-              {showAllPaths ? "Solo selected path" : "Show all four paths"}
-            </button>
-            <button
-              type="button"
-              className={depthMode ? "active" : ""}
-              onClick={toggleDepth}
-              aria-pressed={depthMode}
-            >
-              {depthMode ? "Flatten atmosphere" : "See atmospheric depth"}
-            </button>
-          </div>
-          {selectedReading && (
-            <div className="trace-summary">
-              <span className="trace-line" style={{ background: `rgb(${selectedMetadata.color.slice(0, 3).join(" ")})` }} aria-hidden="true" />
-              <span><strong>{TRACE_HOURS}-hour {selectedMetadata.label.toLowerCase()} path</strong>Modeled horizontal flow at {selectedMetadata.pressureLabel}</span>
+          <div className="selection-heading">
+            <div>
+              <span className="hud-label">Atmosphere arriving here</span>
+              <p className="selection-coordinate">{formatCoordinate(selected)}</p>
             </div>
-          )}
+            {selectedReading && (
+              <div className="selection-peek">
+                <strong>{speedMph(selectedReading)} mph</strong>
+                <span>{selectedMetadata.label}</span>
+              </div>
+            )}
+          </div>
+          <div className="selection-details" id="selection-details">
+            <div className="air-column">
+              {levelReadings.slice().reverse().map(({ level, reading }) => (
+                <button
+                  type="button"
+                  className={level.id === selectedLevel ? "selected" : ""}
+                  key={level.id}
+                  disabled={!reading}
+                  onClick={() => setSelectedLevel(level.id)}
+                >
+                  <i style={{ background: `rgb(${level.color.slice(0, 3).join(" ")})` }} />
+                  <span><b>{level.label}</b><small>{level.pressureLabel}</small></span>
+                  {reading ? (
+                    <>
+                      <em style={{ transform: `rotate(${reading.direction + 180}deg)` }}>↑</em>
+                      <strong>{speedMph(reading)}<small> mph</small></strong>
+                      <u>{formatHeight(level.id, reading.heightMeters)}</u>
+                    </>
+                  ) : (
+                    <u>Below terrain</u>
+                  )}
+                </button>
+              ))}
+            </div>
+            <div className="trajectory-control">
+              <span>Trajectories</span>
+              <div role="group" aria-label="Visible backward trajectories">
+                <button
+                  type="button"
+                  className={!showAllPaths ? "active" : ""}
+                  onClick={() => setShowAllPaths(false)}
+                  aria-pressed={!showAllPaths}
+                >
+                  Selected level
+                </button>
+                <button
+                  type="button"
+                  className={showAllPaths ? "active" : ""}
+                  onClick={() => setShowAllPaths(true)}
+                  aria-pressed={showAllPaths}
+                >
+                  All four
+                </button>
+              </div>
+            </div>
+            {selectedReading && (
+              <div className="trace-summary">
+                <span className="trace-line" style={{ background: `rgb(${selectedMetadata.color.slice(0, 3).join(" ")})` }} aria-hidden="true" />
+                <span><strong>{TRACE_HOURS}-hour {selectedMetadata.label.toLowerCase()} path</strong>Modeled horizontal flow at {selectedMetadata.pressureLabel}</span>
+              </div>
+            )}
+          </div>
         </section>
       ) : (
-        <div className="map-hint"><span aria-hidden="true">+</span> Click anywhere to compare the air column arriving there</div>
+        <div className="map-hint"><span aria-hidden="true">+</span> Click anywhere to compare all four levels and trace where the air came from</div>
       )}
 
       {locationError && <div className="location-error" role="status">{locationError}</div>}
@@ -1157,7 +927,7 @@ export default function Home() {
         <button className="info-close" type="button" onClick={() => setInfoOpen(false)} aria-label="Close information">×</button>
         <span className="hud-label">About the field</span>
         <h1>Read the atmosphere,<br />not a dashboard.</h1>
-        <p className="info-intro">Particles show the selected forecast wind field. Zooming requests a denser regional sample; time blends continuously between hourly model frames. The atmospheric stack compares four horizontal pressure levels without pretending they are one vertical parcel path.</p>
+        <p className="info-intro">Particles show the selected forecast wind field. The altitude rail moves between four pressure levels; clicking the map compares the full air column and traces its modeled flow backward. Zooming requests a denser regional sample, and time blends continuously between hourly model frames.</p>
 
         <dl className="facts">
           <div><dt>Model</dt><dd>NOAA GFS + HRRR seamless</dd></div>
@@ -1167,8 +937,8 @@ export default function Home() {
         </dl>
 
         <section className="method-note">
-          <h2>Atmospheric depth</h2>
-          <p>Pressure surfaces use their modeled geopotential heights above sea level. Height is exaggerated by the factor shown onscreen so the atmosphere is visible at continental scale. Surface wind remains ten metres above local ground.</p>
+          <h2>Pressure levels and height</h2>
+          <p>Pressure surfaces use modeled geopotential height above sea level, so their actual altitude changes with place and time. Surface wind remains ten metres above local ground.</p>
         </section>
 
         <section className="method-note">

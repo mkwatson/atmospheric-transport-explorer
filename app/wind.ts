@@ -570,9 +570,6 @@ export const quantizeBounds = (bounds: WindBounds, step = 0.5): WindBounds => ({
   south: Math.floor(bounds.south / step) * step,
 });
 
-export const depthExaggeration = (zoom: number) =>
-  Math.max(2, Math.round(24 / 2 ** Math.max(0, zoom - 3)));
-
 const COMPASS_POINTS = [
   "N",
   "NNE",
