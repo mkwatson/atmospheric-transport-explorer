@@ -16,7 +16,7 @@ const title = "Atmosphere — See how the air is moving";
 const description =
   "Explore live NOAA forecast wind across the United States. Rotate, zoom, play through time, and trace the air arriving anywhere.";
 const image =
-  "https://atmospheric-transport-explorer.mkw5053.chatgpt.site/og.png";
+  "https://mkwatson.github.io/atmospheric-transport-explorer/og.png";
 
 export const metadata: Metadata = {
   title,
