@@ -2,8 +2,8 @@ import { z } from "zod";
 
 export const DISPLAY_PAST_HOURS = 24;
 export const TRACE_HOURS = 18;
-export const FORECAST_HOURS = 49;
-export const FETCH_PAST_HOURS = DISPLAY_PAST_HOURS + TRACE_HOURS;
+const FORECAST_HOURS = 49;
+const FETCH_PAST_HOURS = DISPLAY_PAST_HOURS + TRACE_HOURS;
 
 export const NATIONAL_WIND_BOUNDS = {
   west: -128,
@@ -109,7 +109,7 @@ export type TracePoint = Coordinate &
     heightMeters: number;
   }>;
 
-export type WindFrame = Readonly<{
+type WindFrame = Readonly<{
   u: readonly number[];
   v: readonly number[];
   heights: readonly number[];
@@ -130,7 +130,7 @@ export type WindField = Readonly<{
   bounds: WindBounds;
 }>;
 
-export type WindFetchSpec = Readonly<{
+type WindFetchSpec = Readonly<{
   bounds?: WindBounds;
   width?: number;
   height?: number;
@@ -569,28 +569,6 @@ export const quantizeBounds = (bounds: WindBounds, step = 0.5): WindBounds => ({
   north: Math.ceil(bounds.north / step) * step,
   south: Math.floor(bounds.south / step) * step,
 });
-
-const COMPASS_POINTS = [
-  "N",
-  "NNE",
-  "NE",
-  "ENE",
-  "E",
-  "ESE",
-  "SE",
-  "SSE",
-  "S",
-  "SSW",
-  "SW",
-  "WSW",
-  "W",
-  "WNW",
-  "NW",
-  "NNW",
-] as const;
-
-export const compassDirection = (degrees: number) =>
-  COMPASS_POINTS[Math.round(degrees / 22.5) % COMPASS_POINTS.length];
 
 export const formatCoordinate = (coordinate: Coordinate) =>
   `${Math.abs(coordinate.lat).toFixed(2)}°${coordinate.lat >= 0 ? "N" : "S"}, ${Math.abs(coordinate.lon).toFixed(2)}°${coordinate.lon >= 0 ? "E" : "W"}`;

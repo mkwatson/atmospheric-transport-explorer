@@ -338,7 +338,6 @@ export default function Home() {
 
   const desiredPrimaryField =
     regionalField?.levels[selectedLevel] ? regionalField : nationalField;
-  const activePrimaryField = desiredPrimaryField;
 
   useEffect(() => {
     if (!desiredPrimaryField) return;
@@ -542,14 +541,14 @@ export default function Home() {
       1 - fieldBlend,
     );
     const currentParticles = particleLayerFor(
-      activePrimaryField,
+      desiredPrimaryField,
       fieldBlend,
     );
     if (previousParticles) layers.push(previousParticles);
     if (currentParticles) layers.push(currentParticles);
 
-    if (reducedMotion && activePrimaryField?.levels[selectedLevel]) {
-      const pair = texturePair(activePrimaryField, selectedLevel, timePosition);
+    if (reducedMotion && desiredPrimaryField?.levels[selectedLevel]) {
+      const pair = texturePair(desiredPrimaryField, selectedLevel, timePosition);
       if (pair.image && pair.image2) {
         layers.push(
           new GridLayer({
@@ -559,7 +558,7 @@ export default function Home() {
             imageWeight: pair.imageWeight,
             imageType: ImageType.VECTOR,
             imageInterpolation: ImageInterpolation.CUBIC,
-            bounds: textureBounds(activePrimaryField.bounds),
+            bounds: textureBounds(desiredPrimaryField.bounds),
             style: GridStyle.ARROW,
             density: 1,
             iconBounds: [0, 40],
@@ -637,7 +636,7 @@ export default function Home() {
 
     return layers;
   }, [
-    activePrimaryField,
+    desiredPrimaryField,
     fieldBlend,
     isMobile,
     particleCount,
