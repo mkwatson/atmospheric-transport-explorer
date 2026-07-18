@@ -95,6 +95,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid rgba(139, 233, 22
 .selection-peek { flex: none; display: grid; gap: 2px; text-align: right; }
 .selection-peek strong { color: #dce6e2; font-family: var(--font-geist-mono), monospace; font-size: 10px; font-weight: 560; }
 .selection-peek span { color: #71878a; font-size: 7px; }
+.selection-peek small { color: #ffbd86; font-family: var(--font-geist-mono), monospace; font-size: 6px; letter-spacing: .04em; text-transform: uppercase; }
 .selection-details { display: block; }
 .air-column { position: relative; display: grid; gap: 3px; padding-left: 1px; }
 .air-column::before { content: ""; position: absolute; z-index: -1; top: 15px; bottom: 15px; left: 13px; width: 1px; background: linear-gradient(180deg, rgba(126,163,255,.42), rgba(202,159,255,.3), rgba(255,189,118,.3), rgba(139,233,220,.42)); }

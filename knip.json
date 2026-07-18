@@ -1,5 +1,5 @@
 {
   "$schema": "https://unpkg.com/knip@5/schema.json",
-  "entry": ["tests/*.test.mjs"],
+  "entry": ["tests/*.test.ts"],
   "ignoreDependencies": ["postcss"]
 }

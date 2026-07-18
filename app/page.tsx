@@ -24,6 +24,7 @@ import {
   sampleWind,
   textureBounds,
   timeAtPosition,
+  timePositionForTimeline,
   windLevel,
   windTexture,
   type Coordinate,
@@ -140,8 +141,29 @@ const particleFieldId = (field: WindField, levelId: WindLevelId) =>
 const speedMph = (reading: WindReading) =>
   Math.round(reading.speed * 2.236_936);
 
+const sampleReading = (
+  nationalField: WindField,
+  regionalField: WindField | null,
+  nationalTimePosition: number,
+  coordinate: Coordinate,
+  levelId: WindLevelId,
+): WindReading | null => {
+  const field =
+    regionalField?.levels[levelId] &&
+    containsCoordinate(regionalField.bounds, coordinate)
+      ? regionalField
+      : nationalField;
+  const fieldTimePosition = timePositionForTimeline(
+    nationalField.times,
+    nationalTimePosition,
+    field.times,
+  );
+  return sampleWind(field, fieldTimePosition, coordinate, levelId);
+};
+
 type LayerBuilderInputs = Readonly<{
   weatherLayers: WeatherLayersModule | null;
+  timelineField: WindField | null;
   primaryField: WindField | null;
   previousField: WindField | null;
   blend: number;
@@ -161,6 +183,7 @@ type StableLayerBuilderInputs = Omit<
 
 const buildDeckLayers = ({
   weatherLayers,
+  timelineField,
   primaryField,
   previousField,
   blend,
@@ -181,12 +204,20 @@ const buildDeckLayers = ({
     ImageType,
     ParticleLayer,
   } = weatherLayers;
+  const positionForField = (field: WindField): number =>
+    timelineField
+      ? timePositionForTimeline(
+          timelineField.times,
+          timePosition,
+          field.times,
+        )
+      : timePosition;
   const particleLayerFor = (
     field: WindField | null,
     opacity: number,
   ): Layer | null => {
     if (!field?.levels[levelId]) return null;
-    const pair = texturePair(field, levelId, timePosition);
+    const pair = texturePair(field, levelId, positionForField(field));
     if (!pair.image || !pair.image2) return null;
     return new ParticleLayer({
       id: particleFieldId(field, levelId),
@@ -214,7 +245,11 @@ const buildDeckLayers = ({
   if (currentParticles) layers.push(currentParticles);
 
   if (reducedMotion && primaryField?.levels[levelId]) {
-    const pair = texturePair(primaryField, levelId, timePosition);
+    const pair = texturePair(
+      primaryField,
+      levelId,
+      positionForField(primaryField),
+    );
     if (pair.image && pair.image2) {
       layers.push(
         new GridLayer({
@@ -383,16 +418,6 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    let current = true;
-    import("weatherlayers-gl").then((module) => {
-      if (current) setWeatherLayers(module);
-    });
-    return () => {
-      current = false;
-    };
-  }, []);
-
-  useEffect(() => {
     if (!mapContainerRef.current || mapRef.current) return;
 
     const map = new maplibregl.Map({
@@ -473,21 +498,31 @@ export default function Home() {
 
   useEffect(() => {
     const controller = new AbortController();
-    fetchWindField(controller.signal)
-      .then((field) => {
+    let current = true;
+    const renderer = import("weatherlayers-gl").catch(() => {
+      throw new Error("The atmospheric renderer could not be loaded.");
+    });
+    Promise.all([fetchWindField(controller.signal), renderer])
+      .then(([field, module]) => {
+        if (!current) return;
         const nowIndex = nearestTimeIndex(field.times, new Date());
         timePositionRef.current = nowIndex;
         setTimePosition(nowIndex);
         setNationalField(field);
+        setWeatherLayers(module);
         setLoadState("ready");
       })
       .catch((reason: unknown) => {
+        if (!current) return;
         if (reason instanceof DOMException && reason.name === "AbortError") return;
         setError(reason instanceof Error ? reason.message : "Live wind data is unavailable.");
         setLoadState("error");
       });
 
-    return () => controller.abort();
+    return () => {
+      current = false;
+      controller.abort();
+    };
   }, [loadAttempt]);
 
   useEffect(() => {
@@ -593,25 +628,32 @@ export default function Home() {
       selected && nationalField
         ? WIND_LEVELS.map((level) => ({
             level,
-            reading: sampleWind(nationalField, timePosition, selected, level.id),
+            reading: sampleReading(
+              nationalField,
+              regionalField,
+              timePosition,
+              selected,
+              level.id,
+            ),
           }))
         : [],
-    [nationalField, selected, timePosition],
+    [nationalField, regionalField, selected, timePosition],
   );
 
   const selectedReading = useMemo(() => {
     if (!selected || !nationalField) return null;
-    const detailedField =
-      regionalField &&
-      regionalField.levels[selectedLevel] &&
-      containsCoordinate(regionalField.bounds, selected)
-        ? regionalField
-        : nationalField;
-    return sampleWind(detailedField, timePosition, selected, selectedLevel);
+    return sampleReading(
+      nationalField,
+      regionalField,
+      timePosition,
+      selected,
+      selectedLevel,
+    );
   }, [nationalField, regionalField, selected, selectedLevel, timePosition]);
 
   const traces = useMemo<readonly TraceDatum[]>(() => {
     if (!selected || !nationalField) return [];
+    // Traces stay national because regional bounds are too small for 18-hour paths.
     const levels = showAllPaths
       ? WIND_LEVELS.map(({ id }) => id)
       : [selectedLevel];
@@ -632,6 +674,7 @@ export default function Home() {
 
   const stableLayerInputsRef = useRef<StableLayerBuilderInputs>({
     weatherLayers,
+    timelineField: nationalField,
     primaryField: desiredPrimaryField,
     previousField: previousPrimaryField,
     levelId: selectedLevel,
@@ -646,6 +689,7 @@ export default function Home() {
     // Builder-input mutation stays in the imperative renderer shell because this is the measured rendering hot path.
     stableLayerInputsRef.current = {
       weatherLayers,
+      timelineField: nationalField,
       primaryField: desiredPrimaryField,
       previousField: previousPrimaryField,
       levelId: selectedLevel,
@@ -658,6 +702,7 @@ export default function Home() {
   }, [
     desiredPrimaryField,
     isMobile,
+    nationalField,
     particleCount,
     previousPrimaryField,
     reducedMotion,
@@ -682,6 +727,7 @@ export default function Home() {
     () =>
       buildDeckLayers({
         weatherLayers,
+        timelineField: nationalField,
         primaryField: desiredPrimaryField,
         previousField: previousPrimaryField,
         blend: previousPrimaryField ? 0 : 1,
@@ -696,6 +742,7 @@ export default function Home() {
     [
       desiredPrimaryField,
       isMobile,
+      nationalField,
       particleCount,
       previousPrimaryField,
       reducedMotion,
@@ -988,7 +1035,7 @@ export default function Home() {
       {loadState !== "ready" && (
         <div className={loadState === "error" ? "data-status error" : "data-status"} role="status">
           {loadState === "loading" ? (
-            <><span className="status-pulse" aria-hidden="true" /> Loading NOAA atmospheric field</>
+            <><span className="status-pulse" aria-hidden="true" /> Loading atmospheric field and renderer</>
           ) : (
             <><span>{error}</span><button type="button" onClick={retryWind}>Retry</button></>
           )}
@@ -1026,6 +1073,7 @@ export default function Home() {
               <div className="selection-peek">
                 <strong>{speedMph(selectedReading)} mph</strong>
                 <span>{selectedMetadata.label}</span>
+                {selectedReading.belowTerrain && <small>Below terrain</small>}
               </div>
             )}
           </div>
@@ -1160,7 +1208,7 @@ export default function Home() {
 
         <section className="method-note">
           <h2>Scientific limits</h2>
-          <p>Particles are a visual reading of interpolated forecast fields. Turbulence, chemistry, dispersion, and vertical parcel motion are not represented. Pressure-level values are shown wherever the model provides them and flagged where the pressure surface lies below local ground.</p>
+          <p>Particles are a visual reading of interpolated forecast fields. Turbulence, chemistry, dispersion, and vertical parcel motion are not represented. Pressure-level values below local ground are model extrapolations rather than physical air, and are flagged wherever the model provides them.</p>
         </section>
 
         <div className="source-links">

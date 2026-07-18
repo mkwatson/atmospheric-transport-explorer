@@ -8,7 +8,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "test": "node --test --experimental-strip-types tests/*.test.mjs",
+    "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "knip": "knip",
@@ -38,7 +38,8 @@
     "eslint-config-next": "^16.2.10",
     "knip": "^5.66.0",
     "tailwindcss": "4.2.1",
-    "typescript": "5.9.3"
+    "typescript": "5.9.3",
+    "vitest": "4.1.10"
   },
   "type": "module"
 }
