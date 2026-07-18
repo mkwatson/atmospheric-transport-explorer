@@ -39,6 +39,7 @@ test("parseWindField turns a valid response into a sampleable field", () => {
   const reading = sampleWind(field, 0, { lon: -99, lat: 39 }, "surface");
   assert.ok(reading);
   assert.ok(Math.abs(reading.speed - 10) < 1e-6);
+  assert.equal(reading.belowTerrain, false);
 });
 
 test("parseWindField rejects a grid whose location count is wrong", () => {
@@ -48,7 +49,7 @@ test("parseWindField rejects a grid whose location count is wrong", () => {
   );
 });
 
-test("parseWindField hides pressure-level wind that sits below terrain", () => {
+test("parseWindField keeps pressure-level wind that sits below terrain", () => {
   const aloftSpec = { bounds, width: 2, height: 2, levels: ["850hPa"] };
   const belowTerrain = Array.from({ length: 4 }, () => ({
     latitude: 39,
@@ -58,11 +59,14 @@ test("parseWindField hides pressure-level wind that sits below terrain", () => {
       time: times,
       wind_speed_850hPa: [12, 12],
       wind_direction_850hPa: [270, 270],
-      // Geopotential height beneath the surface elevation -> not shown.
+      // Geopotential height beneath the surface elevation -> shown and flagged.
       geopotential_height_850hPa: [400, 400],
     },
   }));
 
   const field = parseWindField(belowTerrain, aloftSpec);
-  assert.equal(sampleWind(field, 0, { lon: -99, lat: 39 }, "850hPa"), null);
+  const reading = sampleWind(field, 0, { lon: -99, lat: 39 }, "850hPa");
+  assert.ok(reading);
+  assert.ok(Math.abs(reading.speed - 12) < 1e-6);
+  assert.equal(reading.belowTerrain, true);
 });

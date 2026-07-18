@@ -102,6 +102,7 @@ export type WindVector = Readonly<{
 export type WindReading = WindVector &
   Readonly<{
     heightMeters: number;
+    belowTerrain: boolean;
   }>;
 
 export type TracePoint = Coordinate &
@@ -271,15 +272,11 @@ export const parseWindField = (
           const pressureHeight = metadata.heightVariable
             ? series(hourly, metadata.heightVariable, expectedTimes.length)[timeIndex]
             : elevation + metadata.nominalHeightMeters;
-          const isAboveGround =
-            pressureHeight !== null &&
-            (metadata.id === "surface" || pressureHeight > elevation);
 
           if (
             speed === null ||
             direction === null ||
-            pressureHeight === null ||
-            !isAboveGround
+            pressureHeight === null
           ) {
             return { u: Number.NaN, v: Number.NaN, height: Number.NaN };
           }
@@ -421,7 +418,13 @@ const sampleFrame = (
   const u = bilinearFinite(frame.u, field.width, x, y);
   const v = bilinearFinite(frame.v, field.width, x, y);
   const heightMeters = bilinearFinite(frame.heights, field.width, x, y);
-  if (u === null || v === null || heightMeters === null) return null;
+  const elevationMeters = bilinearFinite(field.elevations, field.width, x, y);
+  if (
+    u === null ||
+    v === null ||
+    heightMeters === null ||
+    elevationMeters === null
+  ) return null;
 
   return {
     u,
@@ -429,6 +432,7 @@ const sampleFrame = (
     speed: Math.hypot(u, v),
     direction: vectorToMeteorologicalDirection(u, v),
     heightMeters,
+    belowTerrain: levelId === "surface" ? false : heightMeters < elevationMeters,
   };
 };
 
@@ -454,6 +458,7 @@ export const sampleWind = (
     direction: vectorToMeteorologicalDirection(u, v),
     heightMeters:
       lower.heightMeters * (1 - weight) + upper.heightMeters * weight,
+    belowTerrain: lower.belowTerrain || upper.belowTerrain,
   };
 };
 
