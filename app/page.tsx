@@ -60,6 +60,9 @@ const REGIONAL_ZOOM = 4.35;
 const REGIONAL_GRID = { desktop: [21, 13], mobile: [17, 11] } as const;
 const FIELD_WARMUP_MILLISECONDS = 1_200;
 const FIELD_FADE_MILLISECONDS = 800;
+const PLAYBACK_STATE_SYNC_MILLISECONDS = 250;
+const SCRUB_STATE_SYNC_MILLISECONDS = 150;
+const VIEWPORT_DEBOUNCE_MILLISECONDS = 250;
 const PARTICLE_SPEED_FACTOR: Readonly<Record<WindLevelId, number>> = {
   surface: 1.5,
   "850hPa": 1.05,
@@ -137,6 +140,169 @@ const particleFieldId = (field: WindField, levelId: WindLevelId) =>
 const speedMph = (reading: WindReading) =>
   Math.round(reading.speed * 2.236_936);
 
+type LayerBuilderInputs = Readonly<{
+  weatherLayers: WeatherLayersModule | null;
+  primaryField: WindField | null;
+  previousField: WindField | null;
+  blend: number;
+  levelId: WindLevelId;
+  timePosition: number;
+  traces: readonly TraceDatum[];
+  reducedMotion: boolean;
+  particleCount: number;
+  isMobile: boolean;
+  selectedColor: readonly [number, number, number, number];
+}>;
+
+type StableLayerBuilderInputs = Omit<
+  LayerBuilderInputs,
+  "blend" | "timePosition"
+>;
+
+const buildDeckLayers = ({
+  weatherLayers,
+  primaryField,
+  previousField,
+  blend,
+  levelId,
+  timePosition,
+  traces,
+  reducedMotion,
+  particleCount,
+  isMobile,
+  selectedColor,
+}: LayerBuilderInputs): Layer[] => {
+  const layers: Layer[] = [];
+  if (!weatherLayers) return layers;
+  const {
+    GridLayer,
+    GridStyle,
+    ImageInterpolation,
+    ImageType,
+    ParticleLayer,
+  } = weatherLayers;
+  const particleLayerFor = (
+    field: WindField | null,
+    opacity: number,
+  ): Layer | null => {
+    if (!field?.levels[levelId]) return null;
+    const pair = texturePair(field, levelId, timePosition);
+    if (!pair.image || !pair.image2) return null;
+    return new ParticleLayer({
+      id: particleFieldId(field, levelId),
+      image: pair.image,
+      image2: pair.image2,
+      imageWeight: pair.imageWeight,
+      imageType: ImageType.VECTOR,
+      imageInterpolation: ImageInterpolation.CUBIC,
+      bounds: textureBounds(field.bounds),
+      palette: SPEED_PALETTE.map(([value, color]) => [value, color]),
+      numParticles: particleCount,
+      maxAge: 110,
+      speedFactor: PARTICLE_SPEED_FACTOR[levelId],
+      width: isMobile ? 1.2 : 1.55,
+      opacity: opacity * 0.92,
+      animate: !reducedMotion,
+      pickable: false,
+    });
+  };
+
+  // Layer-array mutation is contained in this builder because this is the measured rendering hot path.
+  const previousParticles = particleLayerFor(previousField, 1 - blend);
+  const currentParticles = particleLayerFor(primaryField, blend);
+  if (previousParticles) layers.push(previousParticles);
+  if (currentParticles) layers.push(currentParticles);
+
+  if (reducedMotion && primaryField?.levels[levelId]) {
+    const pair = texturePair(primaryField, levelId, timePosition);
+    if (pair.image && pair.image2) {
+      layers.push(
+        new GridLayer({
+          id: "reduced-motion-wind",
+          image: pair.image,
+          image2: pair.image2,
+          imageWeight: pair.imageWeight,
+          imageType: ImageType.VECTOR,
+          imageInterpolation: ImageInterpolation.CUBIC,
+          bounds: textureBounds(primaryField.bounds),
+          style: GridStyle.ARROW,
+          density: 1,
+          iconBounds: [0, 40],
+          iconSize: [8, 21],
+          iconColor: selectedColor,
+          opacity: 0.88,
+        }),
+      );
+    }
+  }
+
+  if (traces.length > 0) {
+    const tracePath = (datum: TraceDatum): [number, number, number][] =>
+      datum.path.map(({ lon, lat }) => [lon, lat, 0]);
+    layers.push(
+      new PathLayer<TraceDatum>({
+        id: "backward-trace-glow",
+        data: traces,
+        getPath: tracePath,
+        getColor: ({ color, selected }) => [
+          color[0],
+          color[1],
+          color[2],
+          selected ? 55 : 20,
+        ],
+        getWidth: ({ selected }) => (selected ? 10 : 5),
+        widthUnits: "pixels",
+        jointRounded: true,
+        capRounded: true,
+        pickable: false,
+      }),
+      new PathLayer<TraceDatum>({
+        id: "backward-traces",
+        data: traces,
+        getPath: tracePath,
+        getColor: ({ color, selected }) => [
+          color[0],
+          color[1],
+          color[2],
+          selected ? 245 : 155,
+        ],
+        getWidth: ({ selected }) => (selected ? 2.8 : 1.35),
+        widthUnits: "pixels",
+        jointRounded: true,
+        capRounded: true,
+        pickable: false,
+      }),
+    );
+
+    const origins = traces.map((trace) => ({
+      trace,
+      position: trace.path.at(-1),
+    }));
+    layers.push(
+      new ScatterplotLayer({
+        id: "trace-origins",
+        data: origins,
+        getPosition: ({ position }: (typeof origins)[number]) => [
+          position?.lon ?? 0,
+          position?.lat ?? 0,
+          0,
+        ],
+        getFillColor: ({ trace }: (typeof origins)[number]) => trace.color,
+        getLineColor: [5, 12, 18, 220],
+        getRadius: ({ trace }: (typeof origins)[number]) =>
+          trace.selected ? 4 : 2.6,
+        radiusUnits: "pixels",
+        stroked: true,
+        lineWidthUnits: "pixels",
+        getLineWidth: 1.5,
+        pickable: false,
+      }),
+    );
+  }
+
+  return layers;
+};
+
 export default function Home() {
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
@@ -144,13 +310,17 @@ export default function Home() {
   const selectedMarkerRef = useRef<Marker | null>(null);
   const regionalCacheRef = useRef(new Map<string, WindField>());
   const lastPrimaryFieldRef = useRef<WindField | null>(null);
+  const fieldBlendRef = useRef(1);
   const timePositionRef = useRef(0);
+  const viewportUpdateTimeoutRef = useRef<number | null>(null);
+  const scrubSyncTimeoutRef = useRef<number | null>(null);
+  const lastScrubSyncRef = useRef(0);
   const [mapReady, setMapReady] = useState(false);
   const [nationalField, setNationalField] = useState<WindField | null>(null);
   const [regionalField, setRegionalField] = useState<WindField | null>(null);
   const [previousPrimaryField, setPreviousPrimaryField] = useState<WindField | null>(null);
-  const [fieldBlend, setFieldBlend] = useState(1);
   const [timePosition, setTimePosition] = useState(0);
+  const [minuteClock, setMinuteClock] = useState(() => Date.now());
   const [loadState, setLoadState] = useState<LoadState>("loading");
   const [refinementState, setRefinementState] = useState<RefinementState>("national");
   const [error, setError] = useState("");
@@ -169,17 +339,33 @@ export default function Home() {
   const [reducedMotion, setReducedMotion] = useState(false);
   const [weatherLayers, setWeatherLayers] = useState<WeatherLayersModule | null>(null);
 
-  const updateViewport = useCallback((map: MapLibreMap) => {
+  const applyViewportBounds = useCallback((map: MapLibreMap) => {
     const nextBounds = regionalViewport(map);
     setViewportBounds(nextBounds);
     if (!nextBounds) {
       setRegionalField(null);
       setRefinementState("national");
     }
+  }, []);
+
+  const updateViewport = useCallback((map: MapLibreMap, debounce: boolean) => {
     const canvas = map.getCanvas();
     setViewportPixels(canvas.clientWidth * canvas.clientHeight);
     setIsMobile(canvas.clientWidth < 720);
-  }, []);
+
+    if (viewportUpdateTimeoutRef.current !== null) {
+      window.clearTimeout(viewportUpdateTimeoutRef.current);
+      viewportUpdateTimeoutRef.current = null;
+    }
+    if (!debounce) {
+      applyViewportBounds(map);
+      return;
+    }
+    viewportUpdateTimeoutRef.current = window.setTimeout(() => {
+      viewportUpdateTimeoutRef.current = null;
+      applyViewportBounds(map);
+    }, VIEWPORT_DEBOUNCE_MILLISECONDS);
+  }, [applyViewportBounds]);
 
   useEffect(() => {
     const media = window.matchMedia("(prefers-reduced-motion: reduce)");
@@ -187,6 +373,13 @@ export default function Home() {
     update();
     media.addEventListener("change", update);
     return () => media.removeEventListener("change", update);
+  }, []);
+
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      setMinuteClock(Date.now());
+    }, 60_000);
+    return () => window.clearInterval(interval);
   }, []);
 
   useEffect(() => {
@@ -248,12 +441,12 @@ export default function Home() {
       });
       map.addControl(overlay as unknown as maplibregl.IControl);
       overlayRef.current = overlay;
-      updateViewport(map);
+      updateViewport(map, false);
       setMapReady(true);
     });
 
-    map.on("moveend", () => updateViewport(map));
-    map.on("resize", () => updateViewport(map));
+    map.on("moveend", () => updateViewport(map, true));
+    map.on("resize", () => updateViewport(map, true));
     map.on("click", ({ lngLat }) => {
       const coordinate = { lon: lngLat.lng, lat: lngLat.lat };
       if (!containsCoordinate(NATIONAL_WIND_BOUNDS, coordinate)) {
@@ -267,6 +460,10 @@ export default function Home() {
 
     mapRef.current = map;
     return () => {
+      if (viewportUpdateTimeoutRef.current !== null) {
+        window.clearTimeout(viewportUpdateTimeoutRef.current);
+        viewportUpdateTimeoutRef.current = null;
+      }
       overlayRef.current?.finalize();
       overlayRef.current = null;
       map.remove();
@@ -339,85 +536,18 @@ export default function Home() {
   const desiredPrimaryField =
     regionalField?.levels[selectedLevel] ? regionalField : nationalField;
 
-  useEffect(() => {
-    if (!desiredPrimaryField) return;
-    const previous = lastPrimaryFieldRef.current;
-    lastPrimaryFieldRef.current = desiredPrimaryField;
-    const sameParticleField =
-      previous &&
-      particleFieldId(previous, selectedLevel) ===
-        particleFieldId(desiredPrimaryField, selectedLevel);
-    if (!previous || sameParticleField || reducedMotion) {
-      setPreviousPrimaryField(null);
-      setFieldBlend(1);
-      return;
-    }
-
-    setPreviousPrimaryField(previous);
-    setFieldBlend(0);
-  }, [desiredPrimaryField, reducedMotion, selectedLevel]);
-
-  useEffect(() => {
-    if (!previousPrimaryField || reducedMotion) return;
-    const startedAt = performance.now();
-    let animationFrame = 0;
-    const animate = (now: number) => {
-      const fadeProgress = Math.min(
-        1,
-        Math.max(
-          0,
-          (now - startedAt - FIELD_WARMUP_MILLISECONDS) /
-            FIELD_FADE_MILLISECONDS,
-        ),
-      );
-      const nextBlend = fadeProgress * fadeProgress * (3 - 2 * fadeProgress);
-      setFieldBlend(nextBlend);
-      if (nextBlend < 1) {
-        animationFrame = requestAnimationFrame(animate);
-      } else {
-        setPreviousPrimaryField(null);
-      }
-    };
-    animationFrame = requestAnimationFrame(animate);
-    return () => cancelAnimationFrame(animationFrame);
-  }, [previousPrimaryField, reducedMotion]);
-
   const minimumTimePosition = TRACE_HOURS;
   const maximumTimePosition = Math.max(
     minimumTimePosition,
     (nationalField?.times.length ?? 1) - 1,
   );
-  const nowIndex = nationalField
-    ? nearestTimeIndex(nationalField.times, new Date())
-    : DISPLAY_PAST_HOURS + TRACE_HOURS;
-
-  const updateTimePosition = useCallback(
-    (position: number) => {
-      const bounded = Math.min(maximumTimePosition, Math.max(minimumTimePosition, position));
-      timePositionRef.current = bounded;
-      setTimePosition(bounded);
-    },
-    [maximumTimePosition, minimumTimePosition],
+  const nowIndex = useMemo(
+    () =>
+      nationalField
+        ? nearestTimeIndex(nationalField.times, new Date(minuteClock))
+        : DISPLAY_PAST_HOURS + TRACE_HOURS,
+    [minuteClock, nationalField],
   );
-
-  useEffect(() => {
-    if (!playing || !nationalField) return;
-    let animationFrame = 0;
-    let previousTimestamp = performance.now();
-    const animate = (timestamp: number) => {
-      const elapsed = timestamp - previousTimestamp;
-      previousTimestamp = timestamp;
-      let next =
-        timePositionRef.current + elapsed / PLAYBACK_MILLISECONDS_PER_HOUR;
-      if (next > maximumTimePosition) {
-        next = minimumTimePosition + (next - maximumTimePosition);
-      }
-      updateTimePosition(next);
-      animationFrame = requestAnimationFrame(animate);
-    };
-    animationFrame = requestAnimationFrame(animate);
-    return () => cancelAnimationFrame(animationFrame);
-  }, [maximumTimePosition, minimumTimePosition, nationalField, playing, updateTimePosition]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -500,158 +630,229 @@ export default function Home() {
       .filter(({ path }) => path.length > 1);
   }, [nationalField, selected, selectedLevel, showAllPaths, timePosition]);
 
-  const deckLayers = useMemo(() => {
-    const layers: Layer[] = [];
-    if (!weatherLayers) return layers;
-    const {
-      GridLayer,
-      GridStyle,
-      ImageInterpolation,
-      ImageType,
-      ParticleLayer,
-    } = weatherLayers;
-    const particleLayerFor = (
-      field: WindField | null,
-      opacity: number,
-    ) => {
-      if (!field?.levels[selectedLevel]) return null;
-      const pair = texturePair(field, selectedLevel, timePosition);
-      if (!pair.image || !pair.image2) return null;
-      return new ParticleLayer({
-        id: particleFieldId(field, selectedLevel),
-        image: pair.image,
-        image2: pair.image2,
-        imageWeight: pair.imageWeight,
-        imageType: ImageType.VECTOR,
-        imageInterpolation: ImageInterpolation.CUBIC,
-        bounds: textureBounds(field.bounds),
-        palette: SPEED_PALETTE.map(([value, color]) => [value, color]),
-        numParticles: particleCount,
-        maxAge: 110,
-        speedFactor: PARTICLE_SPEED_FACTOR[selectedLevel],
-        width: isMobile ? 1.2 : 1.55,
-        opacity: opacity * 0.92,
-        animate: !reducedMotion,
-        pickable: false,
-      });
+  const stableLayerInputsRef = useRef<StableLayerBuilderInputs>({
+    weatherLayers,
+    primaryField: desiredPrimaryField,
+    previousField: previousPrimaryField,
+    levelId: selectedLevel,
+    traces,
+    reducedMotion,
+    particleCount,
+    isMobile,
+    selectedColor: selectedMetadata.color,
+  });
+
+  useEffect(() => {
+    // Builder-input mutation stays in the imperative renderer shell because this is the measured rendering hot path.
+    stableLayerInputsRef.current = {
+      weatherLayers,
+      primaryField: desiredPrimaryField,
+      previousField: previousPrimaryField,
+      levelId: selectedLevel,
+      traces,
+      reducedMotion,
+      particleCount,
+      isMobile,
+      selectedColor: selectedMetadata.color,
     };
-
-    const previousParticles = particleLayerFor(
-      previousPrimaryField,
-      1 - fieldBlend,
-    );
-    const currentParticles = particleLayerFor(
-      desiredPrimaryField,
-      fieldBlend,
-    );
-    if (previousParticles) layers.push(previousParticles);
-    if (currentParticles) layers.push(currentParticles);
-
-    if (reducedMotion && desiredPrimaryField?.levels[selectedLevel]) {
-      const pair = texturePair(desiredPrimaryField, selectedLevel, timePosition);
-      if (pair.image && pair.image2) {
-        layers.push(
-          new GridLayer({
-            id: "reduced-motion-wind",
-            image: pair.image,
-            image2: pair.image2,
-            imageWeight: pair.imageWeight,
-            imageType: ImageType.VECTOR,
-            imageInterpolation: ImageInterpolation.CUBIC,
-            bounds: textureBounds(desiredPrimaryField.bounds),
-            style: GridStyle.ARROW,
-            density: 1,
-            iconBounds: [0, 40],
-            iconSize: [8, 21],
-            iconColor: selectedMetadata.color,
-            opacity: 0.88,
-          }),
-        );
-      }
-    }
-
-    if (traces.length > 0) {
-      const tracePath = (datum: TraceDatum): [number, number, number][] =>
-        datum.path.map(({ lon, lat }) => [lon, lat, 0]);
-      layers.push(
-        new PathLayer<TraceDatum>({
-          id: "backward-trace-glow",
-          data: traces,
-          getPath: tracePath,
-          getColor: ({ color, selected: isSelected }) => [
-            color[0],
-            color[1],
-            color[2],
-            isSelected ? 55 : 20,
-          ],
-          getWidth: ({ selected: isSelected }) => (isSelected ? 10 : 5),
-          widthUnits: "pixels",
-          jointRounded: true,
-          capRounded: true,
-          pickable: false,
-        }),
-        new PathLayer<TraceDatum>({
-          id: "backward-traces",
-          data: traces,
-          getPath: tracePath,
-          getColor: ({ color, selected: isSelected }) => [
-            color[0],
-            color[1],
-            color[2],
-            isSelected ? 245 : 155,
-          ],
-          getWidth: ({ selected: isSelected }) => (isSelected ? 2.8 : 1.35),
-          widthUnits: "pixels",
-          jointRounded: true,
-          capRounded: true,
-          pickable: false,
-        }),
-      );
-
-      const origins = traces.map((trace) => ({
-        trace,
-        position: trace.path.at(-1),
-      }));
-      layers.push(
-        new ScatterplotLayer({
-          id: "trace-origins",
-          data: origins,
-          getPosition: ({ position }: (typeof origins)[number]) => [
-            position?.lon ?? 0,
-            position?.lat ?? 0,
-            0,
-          ],
-          getFillColor: ({ trace }: (typeof origins)[number]) => trace.color,
-          getLineColor: [5, 12, 18, 220],
-          getRadius: ({ trace }: (typeof origins)[number]) =>
-            trace.selected ? 4 : 2.6,
-          radiusUnits: "pixels",
-          stroked: true,
-          lineWidthUnits: "pixels",
-          getLineWidth: 1.5,
-          pickable: false,
-        }),
-      );
-    }
-
-    return layers;
   }, [
     desiredPrimaryField,
-    fieldBlend,
     isMobile,
     particleCount,
     previousPrimaryField,
     reducedMotion,
     selectedLevel,
     selectedMetadata.color,
-    timePosition,
     traces,
     weatherLayers,
   ]);
 
+  const updateOverlayLayers = useCallback(() => {
+    // Direct overlay mutation is contained here because this is the measured rendering hot path.
+    overlayRef.current?.setProps({
+      layers: buildDeckLayers({
+        ...stableLayerInputsRef.current,
+        blend: fieldBlendRef.current,
+        timePosition: timePositionRef.current,
+      }),
+    });
+  }, []);
+
+  const deckLayers = useMemo(
+    () =>
+      buildDeckLayers({
+        weatherLayers,
+        primaryField: desiredPrimaryField,
+        previousField: previousPrimaryField,
+        blend: previousPrimaryField ? 0 : 1,
+        levelId: selectedLevel,
+        timePosition,
+        traces,
+        reducedMotion,
+        particleCount,
+        isMobile,
+        selectedColor: selectedMetadata.color,
+      }),
+    [
+      desiredPrimaryField,
+      isMobile,
+      particleCount,
+      previousPrimaryField,
+      reducedMotion,
+      selectedLevel,
+      selectedMetadata.color,
+      timePosition,
+      traces,
+      weatherLayers,
+    ],
+  );
+
   useEffect(() => {
     overlayRef.current?.setProps({ layers: deckLayers });
   }, [deckLayers, mapReady]);
+
+  useEffect(() => {
+    if (!desiredPrimaryField) return;
+    const previous = lastPrimaryFieldRef.current;
+    lastPrimaryFieldRef.current = desiredPrimaryField;
+    const sameParticleField =
+      previous &&
+      particleFieldId(previous, selectedLevel) ===
+        particleFieldId(desiredPrimaryField, selectedLevel);
+    // Blend ref mutation stays in the imperative renderer shell because this is the measured rendering hot path.
+    if (!previous || sameParticleField || reducedMotion) {
+      fieldBlendRef.current = 1;
+      setPreviousPrimaryField(null);
+      return;
+    }
+
+    fieldBlendRef.current = 0;
+    setPreviousPrimaryField(previous);
+  }, [desiredPrimaryField, reducedMotion, selectedLevel]);
+
+  useEffect(() => {
+    if (!previousPrimaryField || reducedMotion) return;
+    const startedAt = performance.now();
+    let animationFrame = 0;
+    const animate = (now: number) => {
+      const fadeProgress = Math.min(
+        1,
+        Math.max(
+          0,
+          (now - startedAt - FIELD_WARMUP_MILLISECONDS) /
+            FIELD_FADE_MILLISECONDS,
+        ),
+      );
+      const nextBlend = fadeProgress * fadeProgress * (3 - 2 * fadeProgress);
+      // Blend ref mutation is contained here because this is the measured rendering hot path.
+      fieldBlendRef.current = nextBlend;
+      updateOverlayLayers();
+      if (nextBlend < 1) {
+        animationFrame = requestAnimationFrame(animate);
+      } else {
+        setPreviousPrimaryField(null);
+      }
+    };
+    animationFrame = requestAnimationFrame(animate);
+    return () => cancelAnimationFrame(animationFrame);
+  }, [previousPrimaryField, reducedMotion, updateOverlayLayers]);
+
+  const updateLayerTimePosition = useCallback(
+    (position: number) => {
+      const bounded = Math.min(
+        maximumTimePosition,
+        Math.max(minimumTimePosition, position),
+      );
+      // Time ref mutation is contained here because this is the measured rendering hot path.
+      timePositionRef.current = bounded;
+      updateOverlayLayers();
+      return bounded;
+    },
+    [maximumTimePosition, minimumTimePosition, updateOverlayLayers],
+  );
+
+  const updateTimePosition = useCallback(
+    (position: number) => {
+      const bounded = updateLayerTimePosition(position);
+      if (scrubSyncTimeoutRef.current !== null) {
+        window.clearTimeout(scrubSyncTimeoutRef.current);
+        scrubSyncTimeoutRef.current = null;
+      }
+      lastScrubSyncRef.current = performance.now();
+      setTimePosition(bounded);
+    },
+    [updateLayerTimePosition],
+  );
+
+  const scrubTimePosition = useCallback(
+    (position: number) => {
+      const bounded = updateLayerTimePosition(position);
+      const now = performance.now();
+      const remaining =
+        SCRUB_STATE_SYNC_MILLISECONDS - (now - lastScrubSyncRef.current);
+      if (remaining <= 0) {
+        if (scrubSyncTimeoutRef.current !== null) {
+          window.clearTimeout(scrubSyncTimeoutRef.current);
+          scrubSyncTimeoutRef.current = null;
+        }
+        lastScrubSyncRef.current = now;
+        setTimePosition(bounded);
+        return;
+      }
+
+      if (scrubSyncTimeoutRef.current !== null) {
+        window.clearTimeout(scrubSyncTimeoutRef.current);
+      }
+      scrubSyncTimeoutRef.current = window.setTimeout(() => {
+        scrubSyncTimeoutRef.current = null;
+        lastScrubSyncRef.current = performance.now();
+        setTimePosition(timePositionRef.current);
+      }, remaining);
+    },
+    [updateLayerTimePosition],
+  );
+
+  useEffect(() => {
+    if (!playing || !nationalField) return;
+    let animationFrame = 0;
+    let previousTimestamp = performance.now();
+    let lastStateSync = previousTimestamp;
+    const animate = (timestamp: number) => {
+      const elapsed = timestamp - previousTimestamp;
+      previousTimestamp = timestamp;
+      let next =
+        timePositionRef.current + elapsed / PLAYBACK_MILLISECONDS_PER_HOUR;
+      if (next > maximumTimePosition) {
+        next = minimumTimePosition + (next - maximumTimePosition);
+      }
+      next = updateLayerTimePosition(next);
+      if (timestamp - lastStateSync >= PLAYBACK_STATE_SYNC_MILLISECONDS) {
+        lastStateSync = timestamp;
+        setTimePosition(next);
+      }
+      animationFrame = requestAnimationFrame(animate);
+    };
+    animationFrame = requestAnimationFrame(animate);
+    return () => {
+      cancelAnimationFrame(animationFrame);
+      setTimePosition(timePositionRef.current);
+    };
+  }, [
+    maximumTimePosition,
+    minimumTimePosition,
+    nationalField,
+    playing,
+    updateLayerTimePosition,
+  ]);
+
+  useEffect(
+    () => () => {
+      if (scrubSyncTimeoutRef.current !== null) {
+        window.clearTimeout(scrubSyncTimeoutRef.current);
+      }
+    },
+    [],
+  );
 
   const selectCurrentLocation = useCallback(() => {
     if (!navigator.geolocation) {
@@ -910,7 +1111,7 @@ export default function Home() {
             value={timePosition}
             onInput={(event) => {
               setPlaying(false);
-              updateTimePosition(Number(event.currentTarget.value));
+              scrubTimePosition(Number(event.currentTarget.value));
             }}
             disabled={!nationalField}
             aria-label="Forecast valid time"

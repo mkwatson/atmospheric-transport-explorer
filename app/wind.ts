@@ -111,9 +111,9 @@ export type TracePoint = Coordinate &
   }>;
 
 type WindFrame = Readonly<{
-  u: readonly number[];
-  v: readonly number[];
-  heights: readonly number[];
+  u: Float32Array;
+  v: Float32Array;
+  heights: Float32Array;
 }>;
 
 export type WindLevelField = Readonly<{
@@ -257,39 +257,49 @@ export const parseWindField = (
   const levels = spec.levels.reduce<Partial<Record<WindLevelId, WindLevelField>>>(
     (parsed, levelId) => {
       const metadata = windLevel(levelId);
+      const locationSeries = locations.map(({ elevation, hourly }) => ({
+        direction: series(
+          hourly,
+          metadata.directionVariable,
+          expectedTimes.length,
+        ),
+        elevation,
+        height: metadata.heightVariable
+          ? series(hourly, metadata.heightVariable, expectedTimes.length)
+          : null,
+        speed: series(hourly, metadata.speedVariable, expectedTimes.length),
+      }));
       const frames = expectedTimes.map((_, timeIndex) => {
-        const values = locations.map(({ elevation, hourly }) => {
-          const speed = series(
-            hourly,
-            metadata.speedVariable,
-            expectedTimes.length,
-          )[timeIndex];
-          const direction = series(
-            hourly,
-            metadata.directionVariable,
-            expectedTimes.length,
-          )[timeIndex];
-          const pressureHeight = metadata.heightVariable
-            ? series(hourly, metadata.heightVariable, expectedTimes.length)[timeIndex]
-            : elevation + metadata.nominalHeightMeters;
+        const u = new Float32Array(locations.length);
+        const v = new Float32Array(locations.length);
+        const heights = new Float32Array(locations.length);
+
+        // Typed-array mutation is contained here because parsing is the authoritative allocation boundary.
+        locationSeries.forEach((values, locationIndex) => {
+          const speed = values.speed[timeIndex];
+          const direction = values.direction[timeIndex];
+          const pressureHeight = values.height
+            ? values.height[timeIndex]
+            : values.elevation + metadata.nominalHeightMeters;
 
           if (
             speed === null ||
             direction === null ||
             pressureHeight === null
           ) {
-            return { u: Number.NaN, v: Number.NaN, height: Number.NaN };
+            u[locationIndex] = Number.NaN;
+            v[locationIndex] = Number.NaN;
+            heights[locationIndex] = Number.NaN;
+            return;
           }
 
           const vector = meteorologicalWindToVector(speed, direction);
-          return { u: vector.u, v: vector.v, height: pressureHeight };
+          u[locationIndex] = vector.u;
+          v[locationIndex] = vector.v;
+          heights[locationIndex] = pressureHeight;
         });
 
-        return {
-          u: values.map(({ u }) => u),
-          v: values.map(({ v }) => v),
-          heights: values.map(({ height }) => height),
-        };
+        return { u, v, heights };
       });
 
       return { ...parsed, [levelId]: { frames } };
@@ -366,7 +376,7 @@ export const nearestTimeIndex = (times: readonly Date[], target: Date) =>
   );
 
 const bilinearFinite = (
-  values: readonly number[],
+  values: ArrayLike<number>,
   width: number,
   x: number,
   y: number,
@@ -514,10 +524,11 @@ export const windTexture = (
   const frame = field.levels[levelId]?.frames[frameIndex];
   if (!frame) return null;
   const data = new Float32Array(field.width * field.height * 2);
-  frame.u.forEach((u, index) => {
-    data[index * 2] = u;
+  // Typed-array mutation is contained here because texture packing is a measured rendering hot path.
+  for (let index = 0; index < frame.u.length; index += 1) {
+    data[index * 2] = frame.u[index];
     data[index * 2 + 1] = frame.v[index];
-  });
+  }
   return { data, width: field.width, height: field.height };
 };
 
